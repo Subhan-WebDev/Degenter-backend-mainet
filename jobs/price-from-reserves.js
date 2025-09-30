@@ -12,7 +12,7 @@ async function runBounded(items, limit, fn) {
     while (true) {
       const idx = i++;
       if (idx >= items.length) break;
-      try { await fn(items[idx]); } catch { /* logged in fn */ }
+      try { await fn(items[idx]); } catch { /* already logged */ }
     }
   });
   await Promise.all(workers);
@@ -25,10 +25,11 @@ export function startPriceFromReserves() {
         // Only UZIG-quoted pools here; non-uzig handled elsewhere (via fx chain)
         const { rows } = await DB.query(`
           SELECT
-            p.pool_id, p.pair_contract,
+            p.pool_id,
+            p.pair_contract,
             b.token_id  AS base_token_id,
             b.denom     AS base_denom,
-            COALESCE(b.exponent, b.decimals, 6) AS base_exp
+            b.exponent  AS base_exp
           FROM pools p
           JOIN tokens b ON b.token_id = p.base_token_id
           WHERE p.is_uzig_quote = TRUE
@@ -37,10 +38,15 @@ export function startPriceFromReserves() {
 
         await runBounded(rows, CONCURRENCY, async (r) => {
           try {
+            // wait-for-meta: need exponent present
+            if (r.base_exp == null) {
+              debug('[price/job skip] meta not ready', { pool_id: r.pool_id, denom: r.base_denom });
+              return;
+            }
+
             const reserves = await fetchPoolReserves(r.pair_contract);
-            // Guard: must have both sides and be non-zero after normalization
             const price = priceFromReserves_UZIGQuote(
-              { base_denom: r.base_denom, base_exp: r.base_exp },
+              { base_denom: r.base_denom, base_exp: Number(r.base_exp) },
               reserves
             );
             if (price != null && Number.isFinite(price) && price > 0) {
@@ -55,7 +61,6 @@ export function startPriceFromReserves() {
         warn('[priceFromReserves loop]', e.message);
       }
 
-      // sleep seconds → ms
       await new Promise(r => setTimeout(r, PRICE_SIM_SEC * 1000));
     }
   })().catch(()=>{});
