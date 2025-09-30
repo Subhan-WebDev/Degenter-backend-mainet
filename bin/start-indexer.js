@@ -9,9 +9,11 @@ import { drainTrades } from '../core/trades.js';
 import { drainOHLCV } from '../core/ohlcv.js';
 import { drainPoolState } from '../core/pool_state.js';
 
-const MAX_BLOCKS = parseInt(process.env.MAX_BLOCKS || '50000', 10);
-const POLL_SLEEP_MS = parseInt(process.env.POLL_SLEEP_MS || '400', 10);
-const PIPELINE_DEPTH = parseInt(process.env.PIPELINE_DEPTH || '3', 10);
+const ENV_MAX_BLOCKS   = parseInt(process.env.MAX_BLOCKS || '0', 10);      // <=0 => infinite
+const POLL_SLEEP_MS    = parseInt(process.env.POLL_SLEEP_MS || '400', 10);
+const PIPELINE_DEPTH   = parseInt(process.env.PIPELINE_DEPTH || '3', 10);
+const BLOCK_CAP        = Number.isFinite(ENV_MAX_BLOCKS) && ENV_MAX_BLOCKS > 0 ? ENV_MAX_BLOCKS : Infinity;
+const IS_INFINITE_MODE = !Number.isFinite(BLOCK_CAP);
 
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
@@ -35,7 +37,7 @@ async function main() {
   if (!tip0) throw new Error('status: no latest_block_height');
   const saved = await readCheckpoint();
   let current = (saved !== null && saved !== undefined) ? Number(saved) : tip0;
-  info('startup heights:', { tip: tip0, saved, start: current });
+  info('startup heights:', { tip: tip0, saved, start: current, cap: IS_INFINITE_MODE ? 'infinite' : BLOCK_CAP });
 
   let processed = 0;
   const inflight = new Map(); // height -> Promise
@@ -45,25 +47,29 @@ async function main() {
     for (const h of keys) {
       const p = inflight.get(h);
       if (!p) continue;
-      // Only proceed if the promise has resolved
       const r = await p.catch(e => ({ ok:false, error:e }));
       inflight.delete(h);
       await writeCheckpoint(h);
       processed++;
-      info('done height', h, `(${processed}/${MAX_BLOCKS})`);
+      const progress = IS_INFINITE_MODE ? `(${processed})` : `(${processed}/${BLOCK_CAP})`;
+      info('done height', h, progress);
       await drainAll();
+      if (r && r.ok === false && r.error) {
+        // keep going, but show error
+        err(`height ${h} error:`, r.error.stack || r.error);
+      }
     }
   };
 
-  while (processed < MAX_BLOCKS) {
+  while (processed < BLOCK_CAP) {
     const tipNow = unwrapStatus(await getStatus()) ?? tip0;
 
     // fill pipeline
-    while (inflight.size < PIPELINE_DEPTH && current <= tipNow && processed + inflight.size < MAX_BLOCKS) {
+    while (inflight.size < PIPELINE_DEPTH && current <= tipNow && processed + inflight.size < BLOCK_CAP) {
       const h = current++;
       inflight.set(h, (async () => {
         try { await processHeight(h); return { ok: true }; }
-        catch (e) { err(`height ${h}:`, e.stack || e); return { ok:false, error:e }; }
+        catch (e) { return { ok:false, error:e }; }
       })());
     }
 
