@@ -390,3 +390,22 @@ WHERE lt.ctid = r.ctid
 -- Now create the unique index
 CREATE UNIQUE INDEX IF NOT EXISTS ux_large_trades_tx_pool_dir
 ON large_trades (tx_hash, pool_id, direction);
+-- Create September 2025 monthly partition
+CREATE TABLE IF NOT EXISTS ohlcv_1m_2025_09
+  PARTITION OF ohlcv_1m
+  FOR VALUES FROM ('2025-09-01 00:00:00+00')
+               TO   ('2025-10-01 00:00:00+00');
+
+-- Create October 2025 too (so you’re covered)
+CREATE TABLE IF NOT EXISTS ohlcv_1m_2025_10
+  PARTITION OF ohlcv_1m
+  FOR VALUES FROM ('2025-10-01 00:00:00+00')
+               TO   ('2025-11-01 00:00:00+00');
+
+-- (Recommended) add a DEFAULT partition so you never hard-fail again.
+-- If you want a default catch-all:
+CREATE TABLE IF NOT EXISTS ohlcv_1m_default
+  PARTITION OF ohlcv_1m DEFAULT;
+
+ALTER TABLE public.tokens
+  ADD COLUMN IF NOT EXISTS description TEXT;
