@@ -4,7 +4,7 @@ import { info, warn } from '../lib/log.js';
 import { fetch } from 'undici';
 
 const SECURITY_SCAN_SEC = parseInt(process.env.SECURITY_SCAN_SEC || '180', 10);
-const ZIGSCAN_BASE = process.env.ZIGSCAN_BASE || 'https://api.zigscan.net';
+const ZIGSCAN_BASE = process.env.ZIGSCAN_BASE || 'https://public-zigchain-lcd.numia.xyz/';
 
 async function ensureSchema() {
   await DB.query(`
