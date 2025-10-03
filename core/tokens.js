@@ -4,7 +4,7 @@ import { lcdDenomsMetadata, lcdFactoryDenom, lcdIbcDenomTrace } from '../lib/lcd
 import { warn } from '../lib/log.js';
 import { fetch } from 'undici';
 
-// Minimal upsert (unchanged)
+// --- Minimal upsert (unchanged) ---
 export async function upsertTokenMinimal(denom) {
   const { rows } = await DB.query(
     `INSERT INTO tokens(denom, exponent) VALUES ($1, 0)
@@ -17,7 +17,7 @@ export async function upsertTokenMinimal(denom) {
   return r2.rows[0]?.token_id || null;
 }
 
-// Fallback when no LCD metadata/display
+// --- Fallback when no LCD metadata/display ---
 function deriveFromBaseDenom(base) {
   if (typeof base !== 'string') return null;
   const m = base.match(/^u([a-z0-9]+)$/i);
@@ -28,14 +28,14 @@ function deriveFromBaseDenom(base) {
   return { symbol: base.toUpperCase(), display: base.toLowerCase(), exponent: 0 };
 }
 
-// Exponent from denom unit matching `display` (or alias)
+// --- Exponent from denom unit matching `display` (or alias) ---
 function expFromDisplay(meta) {
   if (!meta || !meta.display || !Array.isArray(meta.denom_units)) return null;
   const dus = meta.denom_units;
   const byDenom = dus.find(u => u?.denom === meta.display && typeof u.exponent === 'number');
   if (byDenom) return byDenom.exponent;
-  const byAlias = dus.find(u =>
-    Array.isArray(u.aliases) && u.aliases.includes(meta.display) && typeof u.exponent === 'number'
+  const byAlias = dus.find(
+    u => Array.isArray(u.aliases) && u.aliases.includes(meta.display) && typeof u.exponent === 'number'
   );
   if (byAlias) return byAlias.exponent;
   return null;
@@ -46,8 +46,8 @@ function looksLikeJsonUrl(u = '') {
   try { return /\.json$/i.test(new URL(u).pathname); } catch { return false; }
 }
 function pickIcon(obj) { return obj?.icon || obj?.image || obj?.logo || null; }
-function normString(x) { if (typeof x !== 'string') return null; const s = x.trim(); return s ? s : null; }
-function normUrl(x)    { return normString(x); }
+function normString(x) { if (typeof x !== 'string') return null; const s = x.trim(); return s || null; }
+function normUrl(x) { return normString(x); }
 
 async function resolveUriPayload(uri) {
   if (!uri) return { image_uri: null, website: null, twitter: null, telegram: null, description: null, kind: null };
@@ -63,9 +63,9 @@ async function resolveUriPayload(uri) {
       if (j && typeof j === 'object') {
         return {
           image_uri: normUrl(pickIcon(j)),
-          website:   normUrl(j.website),
-          twitter:   normUrl(j.twitter),
-          telegram:  normUrl(j.telegram),
+          website: normUrl(j.website),
+          twitter: normUrl(j.twitter),
+          telegram: normUrl(j.telegram),
           description: normString(j.description),
           kind: 'json'
         };
@@ -80,8 +80,9 @@ async function resolveUriPayload(uri) {
 /**
  * setTokenMetaFromLCD:
  * - IBC trace resolution
- * - Exponent from denom unit == display (or alias). Can be 0.
- * - If missing: heuristic derive (exponent 0).
+ * - Exponent: from denom unit == display (or alias).
+ *   • For IBC: if missing → default to 6 (stable UI/display).
+ *   • For non-IBC: fallback deriveFromBaseDenom (→ 0 for u-xxx), else 0.
  * - Resolve metadata.uri:
  *    * direct image → image_uri
  *    * JSON → icon→image_uri, website/twitter/telegram/description from JSON
@@ -90,13 +91,14 @@ async function resolveUriPayload(uri) {
  */
 export async function setTokenMetaFromLCD(denom) {
   try {
-    // ensure description column exists (website/twitter/telegram already in your schema)
+    // Ensure description column exists (idempotent)
     await DB.query(`ALTER TABLE IF EXISTS tokens ADD COLUMN IF NOT EXISTS description TEXT`).catch(() => {});
 
     let lookupDenom = denom;
     let isIbc = false;
     let baseFromTrace = null;
 
+    // IBC handling: resolve trace & mark type
     if (typeof denom === 'string' && denom.startsWith('ibc/')) {
       isIbc = true;
       const trace = await lcdIbcDenomTrace(denom).catch(() => null);
@@ -105,30 +107,40 @@ export async function setTokenMetaFromLCD(denom) {
       await DB.query(`UPDATE tokens SET type='ibc' WHERE denom=$1`, [denom]).catch(() => {});
     }
 
+    // Pull LCD metadata for the lookup denom (may be base for IBC)
     const meta = await lcdDenomsMetadata(lookupDenom).catch(() => null);
     const m = meta?.metadata;
 
-    let name    = m?.name        ?? null;
-    let symbol  = m?.symbol      ?? null;
-    let display = m?.display     ?? null;
-    let lcdDesc = m?.description ?? null;
-    let uri     = m?.uri         ?? null;
+    let name     = m?.name ?? null;
+    let symbol   = m?.symbol ?? null;
+    let display  = m?.display ?? null;
+    let lcdDesc  = m?.description ?? null;
+    let uri      = m?.uri ?? null;
 
-    // exponent
-    let exponent = expFromDisplay(m);
-    if (exponent == null) {
-      const baseForDerive = baseFromTrace || lookupDenom;
-      const d = deriveFromBaseDenom(baseForDerive);
-      if (d) {
-        if (!symbol)  symbol  = d.symbol;
-        if (!display) display = d.display;
-        exponent = d.exponent;
+    // Decide exponent exactly once
+    let exponent = expFromDisplay(m); // number | null
+
+    if (isIbc) {
+      // IBC default: 6 if metadata doesn't give an explicit exponent
+      if (typeof exponent !== 'number') exponent = 6;
+    } else {
+      // Non-IBC fallback heuristics (u-xxx → 0)
+      if (exponent == null) {
+        const baseForDerive = baseFromTrace || lookupDenom;
+        const d = deriveFromBaseDenom(baseForDerive);
+        if (d) {
+          if (!symbol)  symbol  = d.symbol;
+          if (!display) display = d.display;
+          exponent = d.exponent; // usually 0 for u-xxx
+        }
       }
+      if (exponent == null) exponent = 0;
     }
-    if (exponent == null) exponent = 0;
+
+    // For IBC with no display from metadata, fall back to the traced base for transparency
     if (!display && isIbc && baseFromTrace) display = baseFromTrace;
 
-    // resolve URI payload (may be image or JSON containing icon/socials/description)
+    // Resolve URI payload (image or JSON w/ icon & socials)
     let imageFromUri = null, siteFromUri = null, twFromUri = null, tgFromUri = null, descFromUri = null;
     if (uri) {
       const r = await resolveUriPayload(uri);
@@ -141,7 +153,7 @@ export async function setTokenMetaFromLCD(denom) {
 
     const finalDesc = normString(descFromUri) || normString(lcdDesc) || null;
 
-    // update (only when we have values; keep existing otherwise)
+    // Final update: only set when we have values; keep existing otherwise
     await DB.query(`
       UPDATE tokens
       SET name        = COALESCE($2,  name),
@@ -160,7 +172,7 @@ export async function setTokenMetaFromLCD(denom) {
       name,
       symbol,
       display,
-      exponent,
+      exponent,                 // IBC → default 6 if unknown; non-IBC → derived or 0
       imageFromUri || null,
       finalDesc,
       siteFromUri || null,
@@ -169,8 +181,8 @@ export async function setTokenMetaFromLCD(denom) {
       isIbc
     ]);
 
-    // factory supply (when available)
-    const fact = await lcdFactoryDenom(lookupDenom).catch(()=>null);
+    // Factory supply (when available)
+    const fact = await lcdFactoryDenom(lookupDenom).catch(() => null);
     if (fact && (fact.total_supply || fact.total_minted)) {
       await DB.query(
         `UPDATE tokens

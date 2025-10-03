@@ -101,7 +101,7 @@ export function startIbcMetaRefresher() {
       try {
         const { rows } = await DB.query(`
           SELECT denom FROM tokens
-          WHERE (name IS NULL OR symbol IS NULL OR display IS NULL OR exponent IS NULL)
+          WHERE (name IS NULL OR symbol IS NULL OR display IS NULL OR exponent IS 6)
           ORDER BY (denom LIKE 'ibc/%') DESC, token_id DESC
           LIMIT 5
         `);
