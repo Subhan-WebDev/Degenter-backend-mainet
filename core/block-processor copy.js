@@ -8,17 +8,17 @@ import { upsertPoolState } from './pool_state.js';
 import { upsertOHLCV1m } from './ohlcv.js';
 import { pgNotify } from '../lib/pg_notify.js';
 import { startFasttrackListener } from '../jobs/fasttrack-listener.js';
-import { DB } from '../lib/db.js';
+import { DB } from '../lib/db.js'; // ⬅️ added so we can check meta readiness
 import {
   digitsOrNull, wasmByAction, byType, buildMsgSenderMap, normalizePair,
   classifyDirection, parseReservesKV, parseAssetsList, sha256hex
 } from './parse.js';
 import { BlockTimer } from './timing.js';
 
-// price helpers
+// ⬇️ price helpers (use same code path as the price job)
 import { upsertPrice, fetchPoolReserves, priceFromReserves_UZIGQuote } from './prices.js';
 
-// Start fast-track ONCE
+// ✅ Start fast-track ONCE, at process boot (not per-pair)
 startFasttrackListener();
 
 const FACTORY_ADDR = process.env.FACTORY_ADDR || '';
@@ -42,7 +42,7 @@ async function runWithConcurrency(tasks, limit, T, labelPrefix) {
   return results;
 }
 
-// caches
+// caches (safe, small)
 const poolsByContract = new Map(); // pairContract -> pool row
 const metaFetched = new Set();
 
@@ -116,11 +116,11 @@ export async function processHeight(h) {
           createdAt: timestamp, height: h, txHash: tx_hash, signer
         });
 
-        // refresh cache
+        // refresh our cache
         const p = await poolWithTokens(poolAddr);
         if (p) poolsByContract.set(poolAddr, p);
 
-        // notify
+        // 🔔 Fast-track notify for the new pair
         if (p) {
           await pgNotify('pair_created', {
             pool_id: p.pool_id,
@@ -194,6 +194,8 @@ export async function processHeight(h) {
         // OHLCV & live price — compute from LCD reserves
         if (pool.is_uzig_quote) {
           try {
+            // 🔒 WAIT FOR META: require exponent/decimals to be known
+            // WAIT FOR META check (both in swap & liquidity branches)
             const { rows: rExp } = await DB.query(
               'SELECT exponent AS exp FROM tokens WHERE token_id = $1',
               [pool.base_id]
@@ -233,10 +235,8 @@ export async function processHeight(h) {
       });
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // liquidity (provide/withdraw)  ← fixed for withdraw
-    // ─────────────────────────────────────────────────────────────────────
-    const provides  = wasmByAction(wasms, 'provide_liquidity');
+    // liquidity (provide/withdraw)
+    const provides = wasmByAction(wasms, 'provide_liquidity');
     const withdraws = wasmByAction(wasms, 'withdraw_liquidity');
     const liqs = [...provides, ...withdraws];
 
@@ -247,41 +247,15 @@ export async function processHeight(h) {
       nLiq++;
       prefetchSet.add(pairContract);
 
-      const isProvide = (le.m.get('action') === 'provide_liquidity');
-      const action = isProvide ? 'provide' : 'withdraw';
-
-      // reserves (explicit if present)
-      let res1d = le.m.get('reserve_asset1_denom') || null;
+      let res1d = le.m.get('reserve_asset1_denom');
       let res1a = digitsOrNull(le.m.get('reserve_asset1_amount'));
-      let res2d = le.m.get('reserve_asset2_denom') || null;
+      let res2d = le.m.get('reserve_asset2_denom');
       let res2a = digitsOrNull(le.m.get('reserve_asset2_amount'));
-
-      // prefer event assets: provide → assets, withdraw → refund_assets
-      const assetsStr = isProvide ? le.m.get('assets') : le.m.get('refund_assets');
-      if ((!res1d || !res1a || !res2d || !res2a) && assetsStr) {
-        const parsed = parseAssetsList(assetsStr);
+      if ((!res1d || !res1a || !res2d || !res2a) && le.m.get('assets')) {
+        const parsed = parseAssetsList(le.m.get('assets'));
         if (parsed?.a1) { res1d = res1d ?? parsed.a1.denom; res1a = res1a ?? digitsOrNull(parsed.a1.amount_base); }
         if (parsed?.a2) { res2d = res2d ?? parsed.a2.denom; res2a = res2a ?? digitsOrNull(parsed.a2.amount_base); }
       }
-
-      // final fallback: reserves blob if any
-      const reservesStr = le.m.get('reserves');
-      if ((!res1d || !res1a || !res2d || !res2a) && reservesStr) {
-        const kv = parseReservesKV(reservesStr);
-        if (kv?.[0]) { res1d = res1d ?? kv[0].denom; res1a = res1a ?? digitsOrNull(kv[0].amount_base); }
-        if (kv?.[1]) { res2d = res2d ?? kv[1].denom; res2a = res2a ?? digitsOrNull(kv[1].amount_base); }
-      }
-
-      // shares:
-      // provide:  share
-      // withdraw: withdrawn_share | withdraw_share | liquidity | burn_share | burnt_share | share
-      const shareBase = digitsOrNull(
-        isProvide
-          ? (le.m.get('share'))
-          : (le.m.get('withdrawn_share') || le.m.get('withdraw_share') ||
-             le.m.get('liquidity')      || le.m.get('burn_share')     ||
-             le.m.get('burnt_share')    || le.m.get('share'))
-      );
 
       const msgIndex = Number(le.m.get('msg_index') ?? li);
       const signerEOA = msgSenderByIndex.get(msgIndex) || null;
@@ -289,13 +263,14 @@ export async function processHeight(h) {
       tasks.push(async () => {
         const pool = await getPoolCached(pairContract);
         if (!pool) return;
+        const action = (le.m.get('action') === 'provide_liquidity' ? 'provide' : 'withdraw');
 
         await insertTrade({
           pool_id: pool.pool_id, pair_contract: pairContract,
           action, direction: action,
           offer_asset_denom: null, offer_amount_base: null,
-          ask_asset_denom:   null, ask_amount_base:   null,
-          return_amount_base: shareBase,
+          ask_asset_denom: null, ask_amount_base: null,
+          return_amount_base: digitsOrNull(le.m.get('share')),
           is_router: false,
           reserve_asset1_denom: res1d, reserve_asset1_amount_base: res1a,
           reserve_asset2_denom: res2d, reserve_asset2_amount_base: res2a,
@@ -306,9 +281,11 @@ export async function processHeight(h) {
           pool.pool_id, pool.base_denom, pool.quote_denom, res1d, res1a, res2d, res2a
         );
 
-        // live price (no OHLCV on liq)
+        // Live price on liquidity tx — compute from LCD reserves (no OHLCV here)
         if (pool.is_uzig_quote) {
           try {
+            // 🔒 WAIT FOR META
+            // WAIT FOR META check (both in swap & liquidity branches)
             const { rows: rExp } = await DB.query(
               'SELECT exponent AS exp FROM tokens WHERE token_id = $1',
               [pool.base_id]
@@ -318,6 +295,7 @@ export async function processHeight(h) {
               debug('[price/skip] meta not ready for base token', { token_id: pool.base_id, denom: pool.base_denom });
               return;
             }
+
 
             const reserves = await fetchPoolReserves(pairContract);
             const price = priceFromReserves_UZIGQuote(
@@ -341,7 +319,7 @@ export async function processHeight(h) {
   }
   T.endMark('scan');
 
-  // PHASE 1: ensure pools exist
+  // === PHASE 1: ensure pools are written before liq/swaps from same tx
   if (poolTasks.length > 0) {
     await runWithConcurrency(poolTasks, BLOCK_PROC_CONCURRENCY, T, 'pools');
   }
@@ -363,12 +341,12 @@ export async function processHeight(h) {
   }
   T.endMark('prefetch');
 
-  // PHASE 2
+  // === PHASE 2: swaps/liquidity
   T.mark('core_tasks');
   if (tasks.length) await runWithConcurrency(tasks, BLOCK_PROC_CONCURRENCY, T, 'core');
   T.endMark('core_tasks');
 
-  // low priority (LCD metadata)
+  // low priority (LCD metadata) — keep small
   T.mark('lowprio');
   if (lowPrioTasks.length) await runWithConcurrency(lowPrioTasks, Math.min(4, BLOCK_PROC_CONCURRENCY), T, 'meta');
   T.endMark('lowprio');
