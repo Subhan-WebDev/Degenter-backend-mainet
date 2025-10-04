@@ -504,96 +504,199 @@ router.get('/:id/security', async (req, res) => {
 /* =======================================================================
    GET /tokens/:id/ohlcv  (delegates to util; supports fill; no GROUP BY errors)
    ======================================================================= */
+// inside api/routes/tokens.js
+
+// helper: parse timeframe to seconds (supports many)
+function tfToSec(tf) {
+  const m = { m:60, h:3600, d:86400, w:604800, M:2592000 }; // 30d month for charts
+  const map = {
+    '1m':60, '5m':300, '15m':900, '30m':1800,
+    '1h':3600, '2h':7200, '4h':14400, '8h':28800, '12h':43200,
+    '1d':86400, '3d':259200, '5d':432000, '1w':604800,
+    '1M':2592000, '3M':7776000
+  };
+  if (map[tf]) return map[tf];
+  const g = /^(\d+)([mhdwM])$/.exec(tf || '');
+  if (!g) return 60;
+  return Number(g[1]) * (m[g[2]] || 60);
+}
+
 router.get('/:id/ohlcv', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
     if (!tok) return res.status(404).json({ success:false, error:'token not found' });
 
-    const tf   = ensureTf(req.query.tf || '1m');
-    const stepSec = TF_MAP[tf];
+    const tf = (req.query.tf || '1m');
+    const stepSec = tfToSec(tf);
+    const mode = (req.query.mode || 'price').toLowerCase();         // price|mcap
+    const unit = (req.query.unit || 'native').toLowerCase();        // native|usd
+    const priceSource = (req.query.priceSource || 'best').toLowerCase(); // best|first|pool|all
+    const poolIdParam = req.query.poolId;
+    const pairParam   = req.query.pair;
+    const fill = (req.query.fill || 'none').toLowerCase();          // prev|zero|none
 
-    // Birdeye-like range controls
-    const spanMap = {
-      '1d': 86400, '3d': 259200, '5d': 432000, '7d': 604800,
-      '1m': 2592000, '3m': 7776000, '6m': 15552000, '1y': 31536000
-    };
-    const nowISO = new Date().toISOString();
-    let from = req.query.from || null;
-    let to   = req.query.to   || nowISO;
+    // resolve time window:
+    const now = new Date();
+    let toIso   = req.query.to || now.toISOString();
+    let fromIso = req.query.from || null;
 
-    if (!from) {
-      if (req.query.span && spanMap[req.query.span]) {
-        const dur = spanMap[req.query.span];
-        from = new Date(new Date(to).getTime() - dur*1000).toISOString();
+    if (!fromIso) {
+      if (req.query.span) {
+        // span like 7d, 3h, etc.
+        const spanSec = tfToSec(req.query.span);
+        const to = new Date(toIso);
+        const from = new Date(to.getTime() - spanSec*1000);
+        fromIso = from.toISOString();
       } else if (req.query.window) {
-        const n = Math.max(1, Math.min(parseInt(req.query.window, 10) || 0, 5000));
-        from = new Date(new Date(to).getTime() - n*stepSec*1000).toISOString();
+        // fixed number of bars
+        const bars = Math.max(1, Math.min(parseInt(req.query.window,10) || 300, 5000));
+        const to = new Date(toIso);
+        const from = new Date(to.getTime() - bars*stepSec*1000);
+        fromIso = from.toISOString();
       } else {
-        // default: 24h window like before
-        from = new Date(new Date(to).getTime() - 24*3600*1000).toISOString();
+        // default: 24h for 1m, else ~300 bars
+        const bars =  tf === '1m' ? 1440 : 300;
+        fromIso = new Date(new Date(toIso).getTime() - bars*stepSec*1000).toISOString();
       }
     }
-
-    // Align to TF boundaries
-    const fromAligned = alignToStep(from, stepSec);
-    const toAligned   = alignToStep(to, stepSec);
-
-    const mode = (req.query.mode || 'price').toLowerCase();
-    const unit = (req.query.unit || 'native').toLowerCase();
-    const fill = (req.query.fill || 'prev').toLowerCase();
-    const priceSource = (req.query.priceSource || 'best').toLowerCase();
-    const poolRef = req.query.poolId || req.query.pair || null;
 
     const zigUsd = await getZigUsd();
 
-    // resolve pool or 'all'
-    let poolId = null, useAll = false;
-    if (priceSource === 'all') useAll = true;
-    else {
-      const sel = await resolvePoolSelection(tok.token_id, { priceSource, poolId: poolRef });
-      poolId = sel.pool?.pool_id ?? null;
-    }
+    // supply (for mcap)
+    const ss = await DB.query(`SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
+    const exp = Number(ss.rows[0]?.exponent || 6);
+    const circ = ss.rows[0]?.total_supply_base != null ? Number(ss.rows[0].total_supply_base) / 10**exp : null;
 
-    // supply for mcap
-    const sup = await DB.query(`SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
-    const exp = Number(sup.rows[0]?.exponent || 6);
-    const circ = (sup.rows[0]?.total_supply_base != null) ? (Number(sup.rows[0].total_supply_base)/(10**exp)) : null;
-
-    // if selected source has no raw bars, fallback to ALL pools automatically
-    const sourceHasBars = await hasRawBars({
-      useAll,
-      tokenId: tok.token_id,
-      poolId,
-      from: fromAligned,
-      to: toAligned
-    });
-    let effectiveUseAll = useAll;
-    let effectivePoolId = poolId;
-    if (!sourceHasBars && !useAll) {
-      effectiveUseAll = true;
-      effectivePoolId = null;
-    }
-
-    const bars = await getCandles({
-      tokenId: tok.token_id,
-      poolId: effectivePoolId,
-      useAll: effectiveUseAll,
-      tf, from: fromAligned, to: toAligned,
-      mode, unit, fill,
-      zigUsd, circ
-    });
-
-    res.json({
-      success: true,
-      data: bars,
-      meta: {
-        tf, mode, unit, fill,
-        priceSource: effectiveUseAll ? 'all' : priceSource,
-        poolId: effectivePoolId ? String(effectivePoolId) : null,
-        from: fromAligned,
-        to: toAligned
+    // resolve pool set:
+    let headerSQL = ``;
+    let params = [];
+    if (priceSource === 'all') {
+      params = [tok.token_id, fromIso, toIso, stepSec];
+      headerSQL = `
+        WITH src AS (
+          SELECT o.pool_id, o.bucket_start, o.open, o.high, o.low, o.close, o.volume_zig, o.trade_count
+          FROM ohlcv_1m o
+          JOIN pools p ON p.pool_id=o.pool_id
+          WHERE p.base_token_id=$1 AND p.is_uzig_quote=TRUE
+            AND o.bucket_start >= $2::timestamptz AND o.bucket_start < $3::timestamptz
+        ),
+      `;
+    } else {
+      // force pool by id or pair
+      let poolRow = null;
+      if (priceSource === 'pool' && (poolIdParam || pairParam)) {
+        const { rows } = await DB.query(
+          `SELECT pool_id FROM pools WHERE (pool_id::text=$1 OR pair_contract=$1) AND base_token_id=$2 LIMIT 1`,
+          [poolIdParam || pairParam, tok.token_id]
+        );
+        poolRow = rows[0] || null;
       }
+      if (!poolRow) {
+        const { pool } = await resolvePoolSelection(tok.token_id, { priceSource, poolId: poolIdParam });
+        poolRow = pool;
+      }
+      if (!poolRow?.pool_id) {
+        return res.json({ success:true, data: [], meta:{ tf, mode, unit, fill, priceSource, poolId:null } });
+      }
+      params = [poolRow.pool_id, fromIso, toIso, stepSec];
+      headerSQL = `
+        WITH src AS (
+          SELECT o.pool_id, o.bucket_start, o.open, o.high, o.low, o.close, o.volume_zig, o.trade_count
+          FROM ohlcv_1m o
+          WHERE o.pool_id=$1
+            AND o.bucket_start >= $2::timestamptz AND o.bucket_start < $3::timestamptz
+        ),
+      `;
+    }
+
+    // aggregate 1m into requested tf; keep volume & trades
+    const { rows } = await DB.query(`
+      ${headerSQL}
+      tagged AS (
+        SELECT
+          bucket_start, open, high, low, close, volume_zig, trade_count,
+          to_timestamp(floor(extract(epoch from bucket_start)/$4)*$4) AT TIME ZONE 'UTC' AS bucket_ts
+        FROM src
+      ),
+      sums AS (
+        SELECT bucket_ts,
+               MIN(low)  AS low,
+               MAX(high) AS high,
+               SUM(volume_zig)  AS volume_native,
+               SUM(trade_count) AS trades
+        FROM tagged
+        GROUP BY bucket_ts
+      ),
+      firsts AS (
+        SELECT DISTINCT ON (bucket_ts) bucket_ts, open
+        FROM tagged
+        ORDER BY bucket_ts, bucket_start ASC
+      ),
+      lasts AS (
+        SELECT DISTINCT ON (bucket_ts) bucket_ts, close
+        FROM tagged
+        ORDER BY bucket_ts, bucket_start DESC
+      )
+      SELECT s.bucket_ts AS ts, f.open, s.high, s.low, l.close, s.volume_native, s.trades
+      FROM sums s
+      LEFT JOIN firsts f USING (bucket_ts)
+      LEFT JOIN lasts  l USING (bucket_ts)
+      ORDER BY ts ASC
+    `, params);
+
+    // JS gap fill (prev/zero/none)
+    const out = [];
+    const start = Math.floor(new Date(fromIso).getTime() / 1000 / stepSec) * stepSec;
+    const end   = Math.floor(new Date(toIso).getTime()   / 1000 / stepSec) * stepSec;
+    const byTs = new Map(rows.map(r => [String(new Date(r.ts).getTime()), r]));
+    let prevClose = null;
+
+    for (let ts = start; ts <= end; ts += stepSec) {
+      const key = String(ts * 1000);
+      const r = byTs.get(key);
+      if (r) {
+        const base = {
+          ts: new Date(ts * 1000).toISOString(),
+          open: Number(r.open),
+          high: Number(r.high),
+          low:  Number(r.low),
+          close:Number(r.close),
+          volume: Number(r.volume_native),
+          trades: Number(r.trades)
+        };
+        prevClose = base.close;
+        out.push(base);
+      } else if (fill !== 'none' && prevClose != null) {
+        const filler = {
+          ts: new Date(ts * 1000).toISOString(),
+          open: prevClose,
+          high: prevClose,
+          low:  prevClose,
+          close:prevClose,
+          volume: 0,
+          trades: 0
+        };
+        out.push(filler);
+      }
+    }
+
+    // convert to mcap or usd if requested
+    const conv = out.map(b => {
+      let o = { ...b };
+      if (mode === 'mcap' && circ != null) {
+        o.open  = o.open  * circ;
+        o.high  = o.high  * circ;
+        o.low   = o.low   * circ;
+        o.close = o.close * circ;
+      }
+      if (unit === 'usd') {
+        o.open  *= zigUsd; o.high *= zigUsd; o.low *= zigUsd; o.close *= zigUsd;
+        o.volume*= zigUsd;
+      }
+      return o;
     });
+
+    res.json({ success:true, data: conv, meta:{ tf, mode, unit, fill, priceSource, poolId: (params[0] && priceSource!=='all') ? String(params[0]) : null } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
