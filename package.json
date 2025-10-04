@@ -15,6 +15,7 @@
     "node": ">=18.17"
   },
   "dependencies": {
+    "chain-registry": "^2.0.73",
     "cors": "^2.8.5",
     "csv-parse": "^6.1.0",
     "dotenv": "^16.4.5",
