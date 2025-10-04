@@ -1,170 +1,211 @@
 // api/ws.js
 import { WebSocketServer } from 'ws';
-import { info } from '../lib/log.js';
 import { DB } from '../lib/db.js';
-import { getZigUsd, resolveTokenId } from './util/resolve-token.js';
-import { getCandles, ensureTf } from './util/ohlcv-agg.js';
-import { resolvePoolSelection } from './util/pool-select.js';
+import { resolveTokenId, getZigUsd } from './util/resolve-token.js';
 
-export function attachWs(httpServer) {
-  const wss = new WebSocketServer({ noServer: true });
-  const channels = new Map(); // key -> Set(ws)
+/* ---------- helpers shared with REST shaping ---------- */
 
-  function sub(ws, key) {
-    if (!channels.has(key)) channels.set(key, new Set());
-    channels.get(key).add(ws);
-  }
-  function unsub(ws) {
-    for (const set of channels.values()) set.delete(ws);
-  }
-  function broadcast(key, payload) {
-    const set = channels.get(key);
-    if (!set) return;
-    const msg = JSON.stringify(payload);
-    for (const ws of set) if (ws.readyState === 1) ws.send(msg);
-  }
+function scale(base, exp, fallback = 6) {
+  if (base == null) return null;
+  const e = (exp == null ? fallback : Number(exp));
+  return Number(base) / 10 ** e;
+}
 
-  httpServer.on('upgrade', (req, socket, head) => {
-    const { url } = req;
-    if (!url.startsWith('/ws/')) {
-      socket.destroy();
-      return;
+function shapeTradeRow(r, zigUsd) {
+  const offerScaled  = scale(r.offer_amount_base,  r.offer_exp,  r.offer_asset_denom === 'uzig' ? 6 : 6);
+  const askScaled    = scale(r.ask_amount_base,    r.ask_exp,    r.ask_asset_denom   === 'uzig' ? 6 : 6);
+  const returnScaled = scale(r.return_amount_base, r.qexp, 6);
+
+  let valueZig = null;
+  if (r.is_uzig_quote) {
+    if (r.direction === 'buy')      valueZig = scale(r.offer_amount_base,  r.qexp, 6);
+    else if (r.direction === 'sell')valueZig = scale(r.return_amount_base, r.qexp, 6);
+    else {
+      valueZig = scale(
+        (r.offer_asset_denom === 'uzig' ? r.offer_amount_base :
+         r.ask_asset_denom   === 'uzig' ? r.ask_amount_base   :
+                                           r.return_amount_base),
+        r.qexp, 6
+      );
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-  });
+  } else {
+    const qPrice = r.pq_price_in_zig != null ? Number(r.pq_price_in_zig) : null;
+    if (qPrice != null) {
+      const quoteAmt =
+        r.direction === 'buy'
+          ? scale(r.offer_amount_base,  r.qexp, 6)
+          : (r.direction === 'sell'
+              ? scale(r.return_amount_base, r.qexp, 6)
+              : scale(
+                  (r.offer_asset_denom === r.ask_asset_denom
+                    ? r.offer_amount_base
+                    : (r.offer_asset_denom === 'uzig' ? r.offer_amount_base
+                      : (r.ask_asset_denom === 'uzig' ? r.ask_amount_base
+                        : r.return_amount_base))),
+                  r.qexp, 6
+                ));
+      valueZig = quoteAmt != null ? quoteAmt * qPrice : null;
+    }
+  }
 
-  wss.on('connection', (ws, req) => {
-    const url = new URL(req.url, 'http://localhost');
-    const path = url.pathname;
+  const valueUsd = valueZig != null ? valueZig * zigUsd : null;
+
+  return {
+    time: r.created_at,
+    txHash: r.tx_hash,
+    pairContract: r.pair_contract,
+    signer: r.signer,
+    direction: r.direction,
+    offerDenom: r.offer_asset_denom,
+    offerAmountBase: r.offer_amount_base,
+    offerAmount: offerScaled,
+    askDenom: r.ask_asset_denom,
+    askAmountBase: r.ask_amount_base,
+    askAmount: askScaled,
+    returnAmountBase: r.return_amount_base,
+    returnAmount: returnScaled,
+    valueNative: valueZig,
+    valueUsd
+  };
+}
+
+/* ---------- topic hub ---------- */
+// topic strings we support now:
+// - 'trades.stream'
+// - 'trades.stream.token:{idOrSymbolOrDenom}'
+// - 'trades.stream.pair:{pairContract}'
+
+export function startWS(server, { path = '/ws' } = {}) {
+  const wss = new WebSocketServer({ server, path });
+  const subs = new Map(); // topic -> Set<WebSocket>
+
+  function addSub(ws, topic) {
+    if (!subs.has(topic)) subs.set(topic, new Set());
+    subs.get(topic).add(ws);
+    ws._topics = ws._topics || new Set();
+    ws._topics.add(topic);
+  }
+
+  function removeSub(ws, topic) {
+    const set = subs.get(topic);
+    if (set) { set.delete(ws); if (set.size === 0) subs.delete(topic); }
+    if (ws._topics) ws._topics.delete(topic);
+  }
+
+  function broadcast(topic, msg) {
+    const set = subs.get(topic);
+    if (!set || set.size === 0) return;
+    const data = JSON.stringify(msg);
+    for (const ws of set) {
+      if (ws.readyState === ws.OPEN) ws.send(data);
+    }
+  }
+
+  // ping keepalive
+  const HEARTBEAT_MS = 25000;
+  setInterval(() => {
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN) {
+        try { client.ping(); } catch {}
+      }
+    }
+  }, HEARTBEAT_MS);
+
+  wss.on('connection', (ws) => {
+    ws.send(JSON.stringify({ ok: true, hello: 'degenter-ws', path }));
 
     ws.on('message', async (raw) => {
-      try {
-        const msg = JSON.parse(String(raw || '{}'));
+      let msg;
+      try { msg = JSON.parse(raw.toString()); }
+      catch { return ws.send(JSON.stringify({ ok:false, error:'invalid_json' })); }
 
-        // ----- Candles -----
-        if (path === '/ws/candles') {
-          const { tokenId: ref, tf = '1m', priceSource = 'best', poolId, useAll, mode = 'price', unit = 'native', fill = 'prev', from, to } = msg;
-          const tok = await resolveTokenId(ref);
-          if (!tok) return ws.send(JSON.stringify({ type: 'error', error: 'token not found' }));
-          const zigUsd = await getZigUsd();
+      const op = String(msg.op || '').toLowerCase();
+      const topic = String(msg.topic || '');
 
-          let selectedPoolId = null;
-          if (!useAll) {
-            const { pool } = await resolvePoolSelection(tok.token_id, { priceSource, poolId });
-            selectedPoolId = pool?.pool_id ?? null;
-          }
-
-          const circRow = await DB.query('SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1', [tok.token_id]);
-          const exp = Number(circRow.rows[0]?.exponent || 6);
-          const circ = circRow.rows[0]?.total_supply_base != null ? Number(circRow.rows[0].total_supply_base) / (10 ** exp) : null;
-
-          const bars = await getCandles({
-            tokenId: tok.token_id,
-            poolId: selectedPoolId,
-            useAll: !!useAll,
-            tf: ensureTf(tf),
-            from, to,
-            zigUsd,
-            mode, unit, fill, priceSource,
-            circ,
-          });
-
-          const key = `candles:${tok.token_id}:${ensureTf(tf)}:${priceSource}:${selectedPoolId || 'all'}`;
-          sub(ws, key);
-          ws.send(JSON.stringify({ type: 'snapshot', key, data: bars, meta: { tf: ensureTf(tf), priceSource, poolId: selectedPoolId, fill } }));
-        }
-
-        // ----- Recent trades feed -----
-        if (path === '/ws/trades') {
-          const { tokenId, poolId, pair, unit = 'usd', minValue = 0 } = msg;
-          const key = `trades:${tokenId || '-'}:${poolId || '-'}:${pair || '-'}:${unit}:${minValue}`;
-          sub(ws, key);
-          ws.send(JSON.stringify({ type: 'subscribed', key }));
-        }
-      } catch (e) {
-        ws.send(JSON.stringify({ type: 'error', error: e.message }));
+      if (op === 'subscribe') {
+        addSub(ws, topic);
+        ws.send(JSON.stringify({ ok:true, subscribed: topic }));
+        return;
       }
+      if (op === 'unsubscribe') {
+        removeSub(ws, topic);
+        ws.send(JSON.stringify({ ok:true, unsubscribed: topic }));
+        return;
+      }
+      ws.send(JSON.stringify({ ok:false, error:'unknown_op' }));
     });
 
-    ws.on('close', () => unsub(ws));
+    ws.on('close', () => {
+      if (!ws._topics) return;
+      for (const t of ws._topics) removeSub(ws, t);
+    });
   });
 
-  // Very simple pollers — replace with NOTIFY/LISTEN or queue in prod.
-
-  // 1) push last minute candle close snapshots (per active candle channel)
-  setInterval(async () => {
-    for (const key of channels.keys()) {
-      if (!key.startsWith('candles:')) continue;
-      const [, tokenId, tf, priceSource, poolKey] = key.split(':');
-      const tokId = Number(tokenId);
+  /* ---------- light poller to push recent trades ---------- */
+  let lastSeenIso = null; // track latest created_at we’ve sent
+  async function pumpTrades() {
+    try {
       const zigUsd = await getZigUsd();
-      const useAll = poolKey === 'all';
-      let poolId = null;
+      // grab the freshest 200 trades since lastSeenIso (or last 10 minutes)
+      const tsClause = lastSeenIso
+        ? `t.created_at > $1::timestamptz`
+        : `t.created_at >= now() - INTERVAL '10 minutes'`;
 
-      if (!useAll) {
-        poolId = Number(poolKey);
-      }
-      const circRow = await DB.query('SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1', [tokId]);
-      const exp = Number(circRow.rows[0]?.exponent || 6);
-      const circ = circRow.rows[0]?.total_supply_base != null ? Number(circRow.rows[0].total_supply_base) / (10 ** exp) : null;
+      const params = lastSeenIso ? [lastSeenIso] : [];
+      const { rows } = await DB.query(`
+        SELECT t.*, p.pair_contract, p.is_uzig_quote, q.exponent AS qexp,
+               (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+               toff.exponent AS offer_exp,
+               task.exponent AS ask_exp
+        FROM trades t
+        JOIN pools  p ON p.pool_id = t.pool_id
+        JOIN tokens q ON q.token_id = p.quote_token_id
+        LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
+        LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
+        WHERE ${tsClause}
+          AND t.action IN ('swap','provide','withdraw')
+        ORDER BY t.created_at ASC
+        LIMIT 200
+      `, params);
 
-      const now = new Date();
-      const from = new Date(now.getTime() - 1000 * 60 * 60 * 24); // last 24h snapshot
-      const bars = await getCandles({
-        tokenId: tokId,
-        poolId,
-        useAll,
-        tf,
-        from: from.toISOString(),
-        to: now.toISOString(),
-        zigUsd,
-        mode: 'price',
-        unit: 'native',
-        fill: 'prev',
-        priceSource,
-        circ,
-      });
-      broadcast(key, { type: 'snapshot', key, data: bars.slice(-200) });
-    }
-  }, 10_000);
+      if (rows.length) {
+        for (const r of rows) {
+          const shaped = shapeTradeRow(r, zigUsd);
+          // global
+          broadcast('trades.stream', { type:'trade', data: shaped });
 
-  // 2) recent trades pusher (every 3s)
-  setInterval(async () => {
-    const since = new Date(Date.now() - 30_000).toISOString();
-    const rows = await DB.query(`
-      SELECT t.*, p.pair_contract, p.is_uzig_quote, q.exponent AS qexp, b.symbol AS base_symbol, q.symbol AS quote_symbol
-      FROM trades t
-      JOIN pools p ON p.pool_id=t.pool_id
-      JOIN tokens b ON b.token_id=p.base_token_id
-      JOIN tokens q ON q.token_id=p.quote_token_id
-      WHERE t.action='swap' AND t.created_at >= $1
-      ORDER BY t.created_at DESC
-      LIMIT 500
-    `, [since]);
+          // per-token (base token inferred via pair—do a quick lookup once)
+          // We can optionally cache pair->base_token_id if needed.
+          // Quick light join to discover base token for per-token topic:
+          const bt = await DB.query(
+            `SELECT b.symbol, b.denom, b.token_id
+             FROM pools p
+             JOIN tokens b ON b.token_id = p.base_token_id
+             WHERE p.pair_contract=$1
+             LIMIT 1`, [r.pair_contract]
+          );
+          if (bt.rows[0]) {
+            const tok = bt.rows[0];
+            const ids = new Set([String(tok.token_id), tok.symbol, tok.denom].filter(Boolean));
+            for (const ref of ids) {
+              broadcast(`trades.stream.token:${ref}`, { type:'trade', data: shaped });
+            }
+          }
 
-    for (const r of rows.rows) {
-      const payload = {
-        type: 'trade',
-        data: {
-          ts: r.created_at,
-          txHash: r.tx_hash,
-          poolId: r.pool_id,
-          pairContract: r.pair_contract,
-          baseSymbol: r.base_symbol,
-          quoteSymbol: r.quote_symbol,
-          direction: r.direction,
-          offerDenom: r.offer_asset_denom,
-          askDenom: r.ask_asset_denom,
-          signer: r.signer,
+          // per-pair
+          broadcast(`trades.stream.pair:${r.pair_contract}`, { type:'trade', data: shaped });
+
+          lastSeenIso = r.created_at; // advance watermark
         }
-      };
-      for (const [key, set] of channels.entries()) {
-        if (!key.startsWith('trades:')) continue;
-        // naive matching: you can refine to actually filter token/pool
-        for (const ws of set) if (ws.readyState === 1) ws.send(JSON.stringify(payload));
       }
+    } catch (e) {
+      // soft-log to console; keep loop alive
+      // console.error('pumpTrades error', e);
+    } finally {
+      setTimeout(pumpTrades, 2000); // run again
     }
-  }, 3_000);
+  }
+  pumpTrades();
 
-  info('ws attached: /ws/candles, /ws/trades');
+  return wss;
 }
