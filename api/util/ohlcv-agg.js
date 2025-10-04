@@ -14,6 +14,12 @@ export function ensureTf(tf) {
   return TF_MAP[k] ? k : '1m';
 }
 
+export function alignToStep(tsISO, stepSec) {
+  const t = Math.floor(new Date(tsISO).getTime() / 1000);
+  const aligned = Math.floor(t / stepSec) * stepSec;
+  return new Date(aligned * 1000).toISOString();
+}
+
 async function getPrevClose({ useAll, tokenId, poolId, from }) {
   if (useAll) {
     const q = await DB.query(`
@@ -41,9 +47,35 @@ async function getPrevClose({ useAll, tokenId, poolId, from }) {
   return null;
 }
 
+export async function hasRawBars({ useAll, tokenId, poolId, from, to }) {
+  if (useAll) {
+    const r = await DB.query(`
+      SELECT 1
+      FROM ohlcv_1m o
+      JOIN pools p ON p.pool_id=o.pool_id
+      WHERE p.base_token_id=$1
+        AND p.is_uzig_quote=TRUE
+        AND o.bucket_start >= $2::timestamptz
+        AND o.bucket_start <  $3::timestamptz
+      LIMIT 1
+    `, [tokenId, from, to]);
+    return !!r.rows.length;
+  } else {
+    const r = await DB.query(`
+      SELECT 1
+      FROM ohlcv_1m
+      WHERE pool_id=$1
+        AND bucket_start >= $2::timestamptz
+        AND bucket_start <  $3::timestamptz
+      LIMIT 1
+    `, [poolId, from, to]);
+    return !!r.rows.length;
+  }
+}
+
 /**
  * Build OHLCV with a continuous series and optional fill:
- *  - Buckets by floor(epoch/step)*step (no date_trunc)
+ *  - Buckets by floor(epoch/step)*step
  *  - open/close from first/last minute inside each bucket
  *  - fill = prev | zero | none
  *  - seeds prev-fill with the last close BEFORE `from`
@@ -61,9 +93,7 @@ export async function getCandles({
   circ = null,
   fill = 'prev',
 }) {
-  const tfKey = ensureTf(tf);
-  const stepSec = TF_MAP[tfKey];
-
+  const stepSec = TF_MAP[ensureTf(tf)];
   const params = [from, to, stepSec];
   let whereSql;
 
@@ -130,11 +160,9 @@ export async function getCandles({
 
   const { rows } = await DB.query(sql, params);
 
-  // ---- seed lastClose from the last minute BEFORE `from` ----
+  // seed lastClose from the last minute BEFORE `from`
   let lastClose = null;
-  if (fill === 'prev') {
-    lastClose = await getPrevClose({ useAll, tokenId, poolId, from });
-  }
+  if (fill === 'prev') lastClose = await getPrevClose({ useAll, tokenId, poolId, from });
 
   const out = [];
   for (const r of rows) {
@@ -150,12 +178,11 @@ export async function getCandles({
         open = high = low = close = 0;
         vol = 0; trades = 0;
       } else {
-        // none -> skip this bucket
         continue;
       }
     }
 
-    // apply transforms AFTER we’ve chosen values
+    // transforms
     if (mode === 'mcap' && circ != null) {
       open *= circ; high *= circ; low *= circ; close *= circ;
     }
@@ -164,7 +191,7 @@ export async function getCandles({
       vol = (vol ?? 0) * zigUsd;
     }
 
-    // update lastClose in native terms, not transformed
+    // update lastClose from native close if available
     lastClose = (r.close != null ? Number(r.close) : lastClose);
 
     out.push({

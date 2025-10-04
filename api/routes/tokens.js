@@ -510,8 +510,34 @@ router.get('/:id/ohlcv', async (req, res) => {
     if (!tok) return res.status(404).json({ success:false, error:'token not found' });
 
     const tf   = ensureTf(req.query.tf || '1m');
-    const from = req.query.from || new Date(Date.now() - 24*3600*1000).toISOString();
-    const to   = req.query.to   || new Date().toISOString();
+    const stepSec = TF_MAP[tf];
+
+    // Birdeye-like range controls
+    const spanMap = {
+      '1d': 86400, '3d': 259200, '5d': 432000, '7d': 604800,
+      '1m': 2592000, '3m': 7776000, '6m': 15552000, '1y': 31536000
+    };
+    const nowISO = new Date().toISOString();
+    let from = req.query.from || null;
+    let to   = req.query.to   || nowISO;
+
+    if (!from) {
+      if (req.query.span && spanMap[req.query.span]) {
+        const dur = spanMap[req.query.span];
+        from = new Date(new Date(to).getTime() - dur*1000).toISOString();
+      } else if (req.query.window) {
+        const n = Math.max(1, Math.min(parseInt(req.query.window, 10) || 0, 5000));
+        from = new Date(new Date(to).getTime() - n*stepSec*1000).toISOString();
+      } else {
+        // default: 24h window like before
+        from = new Date(new Date(to).getTime() - 24*3600*1000).toISOString();
+      }
+    }
+
+    // Align to TF boundaries
+    const fromAligned = alignToStep(from, stepSec);
+    const toAligned   = alignToStep(to, stepSec);
+
     const mode = (req.query.mode || 'price').toLowerCase();
     const unit = (req.query.unit || 'native').toLowerCase();
     const fill = (req.query.fill || 'prev').toLowerCase();
@@ -520,6 +546,7 @@ router.get('/:id/ohlcv', async (req, res) => {
 
     const zigUsd = await getZigUsd();
 
+    // resolve pool or 'all'
     let poolId = null, useAll = false;
     if (priceSource === 'all') useAll = true;
     else {
@@ -527,23 +554,50 @@ router.get('/:id/ohlcv', async (req, res) => {
       poolId = sel.pool?.pool_id ?? null;
     }
 
+    // supply for mcap
     const sup = await DB.query(`SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
     const exp = Number(sup.rows[0]?.exponent || 6);
-    const circ = disp(sup.rows[0]?.total_supply_base, exp);
+    const circ = (sup.rows[0]?.total_supply_base != null) ? (Number(sup.rows[0].total_supply_base)/(10**exp)) : null;
+
+    // if selected source has no raw bars, fallback to ALL pools automatically
+    const sourceHasBars = await hasRawBars({
+      useAll,
+      tokenId: tok.token_id,
+      poolId,
+      from: fromAligned,
+      to: toAligned
+    });
+    let effectiveUseAll = useAll;
+    let effectivePoolId = poolId;
+    if (!sourceHasBars && !useAll) {
+      effectiveUseAll = true;
+      effectivePoolId = null;
+    }
 
     const bars = await getCandles({
       tokenId: tok.token_id,
-      poolId,
-      useAll,
-      tf, from, to,
+      poolId: effectivePoolId,
+      useAll: effectiveUseAll,
+      tf, from: fromAligned, to: toAligned,
       mode, unit, fill,
       zigUsd, circ
     });
 
-    res.json({ success: true, data: bars, meta: { tf, mode, unit, fill, priceSource, poolId: poolId ?? null } });
+    res.json({
+      success: true,
+      data: bars,
+      meta: {
+        tf, mode, unit, fill,
+        priceSource: effectiveUseAll ? 'all' : priceSource,
+        poolId: effectivePoolId ? String(effectivePoolId) : null,
+        from: fromAligned,
+        to: toAligned
+      }
+    });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
+
 
 export default router;
