@@ -1,23 +1,12 @@
 // api/util/ohlcv-agg.js
 import { DB } from '../../lib/db.js';
 
-// human-facing keys we accept
+// Accepted timeframes -> seconds
 export const TF_MAP = {
-  '1m': 60,
-  '5m': 300,
-  '15m': 900,
-  '30m': 1800,
-  '1h': 3600,
-  '2h': 7200,
-  '4h': 14400,
-  '8h': 28800,
-  '12h': 43200,
-  '1d': 86400,
-  '3d': 259200,
-  '5d': 432000,
-  '1w': 604800,
-  '1mth': 2592000,  // ~30d
-  '3mth': 7776000   // ~90d
+  '1m': 60, '5m': 300, '15m': 900, '30m': 1800,
+  '1h': 3600, '2h': 7200, '4h': 14400, '8h': 28800, '12h': 43200,
+  '1d': 86400, '3d': 259200, '5d': 432000, '1w': 604800,
+  '1mth': 2592000, '3mth': 7776000
 };
 
 export function ensureTf(tf) {
@@ -25,11 +14,39 @@ export function ensureTf(tf) {
   return TF_MAP[k] ? k : '1m';
 }
 
+async function getPrevClose({ useAll, tokenId, poolId, from }) {
+  if (useAll) {
+    const q = await DB.query(`
+      SELECT o.close
+      FROM ohlcv_1m o
+      JOIN pools p ON p.pool_id=o.pool_id
+      WHERE p.base_token_id=$1
+        AND p.is_uzig_quote=TRUE
+        AND o.bucket_start < $2::timestamptz
+      ORDER BY o.bucket_start DESC
+      LIMIT 1
+    `, [tokenId, from]);
+    return q.rows[0]?.close != null ? Number(q.rows[0].close) : null;
+  } else if (poolId) {
+    const q = await DB.query(`
+      SELECT close
+      FROM ohlcv_1m
+      WHERE pool_id=$1
+        AND bucket_start < $2::timestamptz
+      ORDER BY bucket_start DESC
+      LIMIT 1
+    `, [poolId, from]);
+    return q.rows[0]?.close != null ? Number(q.rows[0].close) : null;
+  }
+  return null;
+}
+
 /**
  * Build OHLCV with a continuous series and optional fill:
  *  - Buckets by floor(epoch/step)*step (no date_trunc)
  *  - open/close from first/last minute inside each bucket
  *  - fill = prev | zero | none
+ *  - seeds prev-fill with the last close BEFORE `from`
  */
 export async function getCandles({
   mode = 'price',
@@ -69,7 +86,6 @@ export async function getCandles({
     `;
   }
 
-  // Bucket with floor(epoch/step)*step to avoid date_trunc unit errors
   const sql = `
     WITH raw AS (
       SELECT o.bucket_start, o.open, o.high, o.low, o.close, o.volume_zig, o.trade_count
@@ -114,9 +130,13 @@ export async function getCandles({
 
   const { rows } = await DB.query(sql, params);
 
-  const out = [];
+  // ---- seed lastClose from the last minute BEFORE `from` ----
   let lastClose = null;
+  if (fill === 'prev') {
+    lastClose = await getPrevClose({ useAll, tokenId, poolId, from });
+  }
 
+  const out = [];
   for (const r of rows) {
     let open = r.open, high = r.high, low = r.low, close = r.close;
     let vol = r.volume_native, trades = r.trades;
@@ -129,11 +149,13 @@ export async function getCandles({
       } else if (fill === 'zero') {
         open = high = low = close = 0;
         vol = 0; trades = 0;
-      } else { // none
+      } else {
+        // none -> skip this bucket
         continue;
       }
     }
 
+    // apply transforms AFTER we’ve chosen values
     if (mode === 'mcap' && circ != null) {
       open *= circ; high *= circ; low *= circ; close *= circ;
     }
@@ -142,7 +164,9 @@ export async function getCandles({
       vol = (vol ?? 0) * zigUsd;
     }
 
-    lastClose = close;
+    // update lastClose in native terms, not transformed
+    lastClose = (r.close != null ? Number(r.close) : lastClose);
+
     out.push({
       ts: r.ts,
       open: Number(open ?? 0),
