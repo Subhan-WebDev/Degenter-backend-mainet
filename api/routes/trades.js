@@ -325,74 +325,96 @@ router.get('/pool/:ref', async (req, res) => {
   }
 });
 
-/** GET /trades/wallet/:address */
 router.get('/wallet/:address', async (req, res) => {
   try {
     const address = req.params.address;
-
-    const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:1000 });
-    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0    });
-    const dir    = normDir(req.query.direction);
+    const unit    = String(req.query.unit || 'usd').toLowerCase();
+    const limit   = clampInt(req.query.limit,  { min:1, max:5000, def:1000 });
+    const offset  = clampInt(req.query.offset, { min:0, max:1e9,  def:0    });
+    const dir     = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
 
     const zigUsd = await getZigUsd();
 
-    // optional token/pair/pool scoping
-    let extras = { scope: 'wallet', scopeValue: address };
-    let joinExtra = '';
+    // ---- Build WHERE + params safely (no placeholder collisions) ----
+    const where = [];
+    const params = [];
+
+    // scope: wallet
+    where.push(`t.signer = $${params.length + 1}`);
+    params.push(address);
+
+    // action filter
+    if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
+    else where.push(`t.action = 'swap'`);
+
+    // optional direction
+    if (dir) {
+      where.push(`t.direction = $${params.length + 1}`);
+      params.push(dir);
+    }
+
+    // time window
+    const { clause: timeClause } = buildWindow(
+      { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
+      params
+    );
+    where.push(timeClause);
+
+    // optional scoping by token / pair / pool
+    let extraJoin = ''; // add JOIN tokens b (base) only if token filter present
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
       if (tok) {
-        extras.scope = 'token';         // reuse token scope and add wallet filter manually
-        extras.scopeValue = tok.token_id;
-        joinExtra = ` AND t.signer = $${1} `; // we’ll splice this below
+        extraJoin += ` JOIN tokens b ON b.token_id = p.base_token_id `;
+        where.push(`b.token_id = $${params.length + 1}`);
+        params.push(tok.token_id); // BIGINT param, matches column type
       }
     }
 
-    // build base
-    const built = buildTradesQuery({
-      scope: extras.scope,
-      scopeValue: extras.scopeValue,
-      includeLiquidity,
-      direction: dir,
-      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      limit, offset
-    });
-
-    // now tweak WHERE for wallet + (optional pair/pool)
-    // safer: wrap in subselect
-    const pair = req.query.pair;
-    const poolId = req.query.poolId;
-
-    let params = [];
-    let where2 = [`t.signer = $1`]; // always wallet filter
-
-    if (pair) {
-      where2.push(`p.pair_contract = $${params.length + 2}`);
-      params.push(pair);
-    } else if (poolId) {
-      where2.push(`p.pool_id = $${params.length + 2}`);
-      params.push(poolId);
+    if (req.query.pair) {
+      where.push(`p.pair_contract = $${params.length + 1}`);
+      params.push(String(req.query.pair));
+    } else if (req.query.poolId) {
+      where.push(`p.pool_id = $${params.length + 1}`);
+      params.push(String(req.query.poolId));
     }
 
-    // recompose SQL using the same SELECT list, but replace WHERE with wallet-scope AND the original conditions
-    const sql = built.sql.replace(
-      /WHERE\s+(.+)\s+ORDER BY/s,
-      (m, old) => `WHERE ${where2.join(' AND ')} AND ${old} ORDER BY`
-    );
-
-    params = [address, ...params, ...built.params];
+    const sql = `
+      WITH base AS (
+        SELECT
+          t.*,
+          p.pair_contract,
+          p.is_uzig_quote,
+          q.exponent AS qexp,
+          -- latest price of QUOTE token in ZIG (when quote != uzig)
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+          toff.exponent AS offer_exp,
+          task.exponent AS ask_exp,
+          COUNT(*) OVER() AS total
+        FROM trades t
+        JOIN pools  p ON p.pool_id = t.pool_id
+        JOIN tokens q ON q.token_id = p.quote_token_id
+        ${extraJoin}
+        LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
+        LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
+        WHERE ${where.join(' AND ')}
+        ORDER BY t.created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      )
+      SELECT * FROM base
+    `;
 
     const { rows } = await DB.query(sql, params);
+
     const data = rows.map(r => shapeRow(r, unit, zigUsd));
     const total = rows[0]?.total ? Number(rows[0].total) : data.length;
-    res.json({ success:true, data, meta:{ unit, tf:req.query.tf||'1d', limit, offset, total } });
+
+    res.json({ success:true, data, meta:{ unit, tf:req.query.tf || '24h', limit, offset, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
-
 /** GET /trades/large?bucket=30m|1h|4h|24h&unit=zig|usd&minValue=&maxValue= */
 router.get('/large', async (req, res) => {
   try {
