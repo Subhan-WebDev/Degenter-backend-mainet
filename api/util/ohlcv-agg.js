@@ -21,123 +21,123 @@ export const TF_MAP = {
 
 export function ensureTf(tf) {
   const k = (tf || '1m').toLowerCase();
-  if (!TF_MAP[k]) return '1m';
-  return k;
+  return TF_MAP[k] ? k : '1m';
 }
 
 /**
- * getCandles({ mode, unit, tf, from, to, priceSource, poolId, tokenId, useAll })
- *  - mode: 'price' | 'mcap'
- *  - unit: 'native' | 'usd'
- *  - useAll: true to aggregate across all UZIG-quote pools for the token
- *  - fill: 'prev' | 'zero' | 'none'
+ * Robust aggregator that:
+ *  - Builds a continuous time series (from..to) at the chosen TF
+ *  - Aggregates OHLC with proper first/last on minute buckets (no GROUP BY errors)
+ *  - Supports fill = prev | zero | none
  */
-export async function getCandles(args) {
-  const {
-    mode = 'price',
-    unit = 'native',
-    tf = '1m',
-    from,
-    to,
-    priceSource = 'best',
-    poolId = null,
-    tokenId = null,
-    useAll = false,
-    zigUsd = 1,
-    circ = null,        // for mcap
-    fill = 'prev',
-  } = args;
-
-  const tfsql = TF_MAP[ensureTf(tf)];
-  const params = [];
-  let whereSql = '';
-  let idx = 1;
-
+export async function getCandles({
+  mode = 'price',
+  unit = 'native',
+  tf = '1m',
+  from,
+  to,
+  useAll = false,
+  tokenId = null,
+  poolId = null,
+  zigUsd = 1,
+  circ = null,
+  fill = 'prev',
+}) {
+  const tfi = TF_MAP[ensureTf(tf)];
+  const params = [from, to];
+  let whereSql;
   if (useAll) {
-    // all UZIG quote pools of token
+    // aggregate all UZIG-quote pools for this token
     params.push(tokenId);
-    params.push(from);
-    params.push(to);
     whereSql = `
       FROM ohlcv_1m o
       JOIN pools p ON p.pool_id=o.pool_id
-      WHERE p.base_token_id=$${idx++} AND p.is_uzig_quote=TRUE
-        AND o.bucket_start >= $${idx++}::timestamptz
-        AND o.bucket_start <  $${idx++}::timestamptz
+      WHERE p.base_token_id=$3 AND p.is_uzig_quote=TRUE
+        AND o.bucket_start >= $1::timestamptz
+        AND o.bucket_start <  $2::timestamptz
     `;
   } else {
-    // single pool
     params.push(poolId);
-    params.push(from);
-    params.push(to);
     whereSql = `
       FROM ohlcv_1m o
-      WHERE o.pool_id=$${idx++}
-        AND o.bucket_start >= $${idx++}::timestamptz
-        AND o.bucket_start <  $${idx++}::timestamptz
+      WHERE o.pool_id=$3
+        AND o.bucket_start >= $1::timestamptz
+        AND o.bucket_start <  $2::timestamptz
     `;
   }
 
-  // Aggregate to requested TF; keep OHLC semantics via first/last on minute buckets
+  // Use a generate_series to create a continuous bucket timeline, then left join per-bucket aggregates.
+  // We compute open/close by selecting the minute rows at min/max bucket_start within each bucket.
   const sql = `
     WITH raw AS (
       SELECT o.bucket_start, o.open, o.high, o.low, o.close, o.volume_zig, o.trade_count
       ${whereSql}
     ),
-    bucketed AS (
+    tagged AS (
       SELECT
-        date_trunc('${tfsql}', bucket_start) AS ts,
-        FIRST_VALUE(open)  OVER (PARTITION BY date_trunc('${tfsql}', bucket_start) ORDER BY bucket_start ASC)  AS open,
-        MAX(high) AS high,
-        MIN(low)  AS low,
-        FIRST_VALUE(close) OVER (PARTITION BY date_trunc('${tfsql}', bucket_start) ORDER BY bucket_start DESC) AS close,
-        SUM(volume_zig) AS vol,
-        SUM(trade_count) AS trades
+        bucket_start,
+        open, high, low, close, volume_zig, trade_count,
+        date_trunc('${tfi}', bucket_start) AS bucket_ts
       FROM raw
-      GROUP BY ts
     ),
-    range AS (
-      SELECT generate_series($2::timestamptz, $3::timestamptz - INTERVAL '1 second', '${tfsql}'::interval) AS ts
+    agg AS (
+      SELECT
+        bucket_ts,
+        MIN(low) AS low,
+        MAX(high) AS high,
+        SUM(volume_zig) AS volume_native,
+        SUM(trade_count) AS trades,
+        MIN(bucket_start) AS ts_open,
+        MAX(bucket_start) AS ts_close
+      FROM tagged
+      GROUP BY bucket_ts
+    ),
+    o AS (
+      SELECT
+        a.bucket_ts AS ts,
+        (SELECT t.open  FROM tagged t WHERE t.bucket_start=a.ts_open  LIMIT 1) AS open,
+        (SELECT t.close FROM tagged t WHERE t.bucket_start=a.ts_close LIMIT 1) AS close,
+        a.low, a.high, a.volume_native, a.trades
+      FROM agg a
     ),
     series AS (
-      SELECT r.ts, b.open, b.high, b.low, b.close, b.vol, b.trades
-      FROM range r
-      LEFT JOIN bucketed b ON b.ts = r.ts
-      ORDER BY r.ts
+      SELECT generate_series($1::timestamptz, $2::timestamptz - interval '1 second', '${tfi}'::interval) AS ts
     )
-    SELECT * FROM series;
+    SELECT s.ts,
+           o.open, o.high, o.low, o.close, o.volume_native, o.trades
+    FROM series s
+    LEFT JOIN o ON o.ts = s.ts
+    ORDER BY s.ts;
   `;
 
   const { rows } = await DB.query(sql, params);
 
-  // fill behaviour + unit/mode transform
   const out = [];
   let lastClose = null;
 
   for (const r of rows) {
     let open = r.open, high = r.high, low = r.low, close = r.close;
-    let vol = r.vol, trades = r.trades;
+    let vol = r.volume_native, trades = r.trades;
 
-    if (open == null || high == null || low == null || close == null) {
+    const empty = (open == null || high == null || low == null || close == null);
+    if (empty) {
       if (fill === 'prev' && lastClose != null) {
         open = high = low = close = lastClose;
         vol = 0; trades = 0;
       } else if (fill === 'zero') {
         open = high = low = close = 0;
         vol = 0; trades = 0;
-      } else {
-        // none: skip empty bars
+      } else { // none
         continue;
       }
     }
 
-    // transform to mcap if requested
     if (mode === 'mcap' && circ != null) {
-      open = open * circ; high = high * circ; low = low * circ; close = close * circ;
+      open *= circ; high *= circ; low *= circ; close *= circ;
     }
-
     if (unit === 'usd') {
-      open *= zigUsd; high *= zigUsd; low *= zigUsd; close *= zigUsd; vol = (vol ?? 0) * zigUsd;
+      open *= zigUsd; high *= zigUsd; low *= zigUsd; close *= zigUsd;
+      vol = (vol ?? 0) * zigUsd;
     }
 
     lastClose = close;
