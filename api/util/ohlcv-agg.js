@@ -1,34 +1,35 @@
 // api/util/ohlcv-agg.js
 import { DB } from '../../lib/db.js';
 
+// human-facing keys we accept
 export const TF_MAP = {
-  '1m': '1 minute',
-  '5m': '5 minutes',
-  '15m': '15 minutes',
-  '30m': '30 minutes',
-  '1h': '1 hour',
-  '2h': '2 hours',
-  '4h': '4 hours',
-  '8h': '8 hours',
-  '12h': '12 hours',
-  '1d': '1 day',
-  '3d': '3 days',
-  '5d': '5 days',
-  '1w': '7 days',
-  '1mth': '1 month',
-  '3mth': '3 months',
+  '1m': 60,
+  '5m': 300,
+  '15m': 900,
+  '30m': 1800,
+  '1h': 3600,
+  '2h': 7200,
+  '4h': 14400,
+  '8h': 28800,
+  '12h': 43200,
+  '1d': 86400,
+  '3d': 259200,
+  '5d': 432000,
+  '1w': 604800,
+  '1mth': 2592000,  // ~30d
+  '3mth': 7776000   // ~90d
 };
 
 export function ensureTf(tf) {
-  const k = (tf || '1m').toLowerCase();
+  const k = String(tf || '1m').toLowerCase();
   return TF_MAP[k] ? k : '1m';
 }
 
 /**
- * Robust aggregator that:
- *  - Builds a continuous time series (from..to) at the chosen TF
- *  - Aggregates OHLC with proper first/last on minute buckets (no GROUP BY errors)
- *  - Supports fill = prev | zero | none
+ * Build OHLCV with a continuous series and optional fill:
+ *  - Buckets by floor(epoch/step)*step (no date_trunc)
+ *  - open/close from first/last minute inside each bucket
+ *  - fill = prev | zero | none
  */
 export async function getCandles({
   mode = 'price',
@@ -43,16 +44,18 @@ export async function getCandles({
   circ = null,
   fill = 'prev',
 }) {
-  const tfi = TF_MAP[ensureTf(tf)];
-  const params = [from, to];
+  const tfKey = ensureTf(tf);
+  const stepSec = TF_MAP[tfKey];
+
+  const params = [from, to, stepSec];
   let whereSql;
+
   if (useAll) {
-    // aggregate all UZIG-quote pools for this token
     params.push(tokenId);
     whereSql = `
       FROM ohlcv_1m o
       JOIN pools p ON p.pool_id=o.pool_id
-      WHERE p.base_token_id=$3 AND p.is_uzig_quote=TRUE
+      WHERE p.base_token_id=$4 AND p.is_uzig_quote=TRUE
         AND o.bucket_start >= $1::timestamptz
         AND o.bucket_start <  $2::timestamptz
     `;
@@ -60,14 +63,13 @@ export async function getCandles({
     params.push(poolId);
     whereSql = `
       FROM ohlcv_1m o
-      WHERE o.pool_id=$3
+      WHERE o.pool_id=$4
         AND o.bucket_start >= $1::timestamptz
         AND o.bucket_start <  $2::timestamptz
     `;
   }
 
-  // Use a generate_series to create a continuous bucket timeline, then left join per-bucket aggregates.
-  // We compute open/close by selecting the minute rows at min/max bucket_start within each bucket.
+  // Bucket with floor(epoch/step)*step to avoid date_trunc unit errors
   const sql = `
     WITH raw AS (
       SELECT o.bucket_start, o.open, o.high, o.low, o.close, o.volume_zig, o.trade_count
@@ -77,7 +79,7 @@ export async function getCandles({
       SELECT
         bucket_start,
         open, high, low, close, volume_zig, trade_count,
-        date_trunc('${tfi}', bucket_start) AS bucket_ts
+        to_timestamp(floor(extract(epoch from bucket_start)/$3)*$3) AT TIME ZONE 'UTC' AS bucket_ts
       FROM raw
     ),
     agg AS (
@@ -101,7 +103,7 @@ export async function getCandles({
       FROM agg a
     ),
     series AS (
-      SELECT generate_series($1::timestamptz, $2::timestamptz - interval '1 second', '${tfi}'::interval) AS ts
+      SELECT generate_series($1::timestamptz, $2::timestamptz - interval '1 second', make_interval(secs => $3)) AS ts
     )
     SELECT s.ts,
            o.open, o.high, o.low, o.close, o.volume_native, o.trades
