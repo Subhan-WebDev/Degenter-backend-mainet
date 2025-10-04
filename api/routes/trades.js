@@ -7,11 +7,17 @@ const router = express.Router();
 
 /* ---------------- helpers ---------------- */
 
-const DIRS = new Set(['buy','sell','provide','withdraw']);
+const VALID_DIR = new Set(['buy','sell','provide','withdraw']);
 
 function normDir(d) {
   const x = String(d || '').toLowerCase();
-  return DIRS.has(x) ? x : null;
+  return VALID_DIR.has(x) ? x : null;
+}
+
+function clampInt(v, { min = 0, max = 1e9, def = 0 } = {}) {
+  const n = Number.parseInt(v, 10);
+  if (Number.isNaN(n)) return def;
+  return Math.max(min, Math.min(max, n));
 }
 
 function classify(v, unit) {
@@ -28,13 +34,6 @@ function classify(v, unit) {
   }
 }
 
-function windowWhere({ tf, from, to, days }) {
-  if (from && to) return { where: `t.created_at >= $X::timestamptz AND t.created_at < $Y::timestamptz`, mode: 'range' };
-  if (days) return { where: `t.created_at >= now() - ($D || ' days')::interval`, mode: 'days' };
-  const mins = { '1h':60, '4h':240, '24h':1440, '7d':10080 }[String(tf||'24h').toLowerCase()] ?? 1440;
-  return { where: `t.created_at >= now() - INTERVAL '${mins} minutes'`, mode: 'rel' };
-}
-
 // scale base amount using exponent; uzig => 6 by default
 function scale(base, exp, fallback = 6) {
   if (base == null) return null;
@@ -42,25 +41,83 @@ function scale(base, exp, fallback = 6) {
   return Number(base) / 10 ** e;
 }
 
-/** Build SELECT … FROM … WHERE … common block.
- *  includeLiquidity=1 will include provide/withdraw otherwise only swaps.
- *  direction: buy|sell|provide|withdraw (optional)
- *  target: "all" | "token" | "pool" | "wallet"
- */
-function makeSQL({ where, hasRangeOrDays, actionFilter, direction, extraJoins, extraWheres, limit, offset }) {
-  // NOTE: we fetch quote exponent, and the quote->zig price for non-uzig pairs
-  // also exponents for offer/ask denoms (so amounts are scaled correctly)
-  const dirSQL = direction ? `AND t.direction=$DIR` : '';
-  const actSQL = actionFilter === 'all' ? `AND t.action IN ('swap','provide','withdraw')`
-                                        : `AND t.action='swap'`;
+function minutesForTf(tf) {
+  const m = (tf || '').toLowerCase();
+  const map = { '1h':60, '4h':240, '24h':1440, '7d':10080 };
+  return map[m] || 1440;
+}
 
-  const timeSQL = hasRangeOrDays === 'range'
-    ? `AND t.created_at >= $F::timestamptz AND t.created_at < $T::timestamptz`
-    : (hasRangeOrDays === 'days'
-        ? `AND t.created_at >= now() - ($D || ' days')::interval`
-        : where);
+/** Build time window clause + params */
+function buildWindow({ tf, from, to, days }, params) {
+  const clauses = [];
+  if (from && to) {
+    clauses.push(`t.created_at >= $${params.length + 1}::timestamptz`);
+    params.push(from);
+    clauses.push(`t.created_at < $${params.length + 1}::timestamptz`);
+    params.push(to);
+    return { clause: clauses.join(' AND ') };
+  }
+  if (days) {
+    const d = clampInt(days, { min: 1, max: 60, def: 1 });
+    clauses.push(`t.created_at >= now() - ($${params.length + 1} || ' days')::interval`);
+    params.push(String(d));
+    return { clause: clauses.join(' AND ') };
+  }
+  const mins = minutesForTf(tf);
+  clauses.push(`t.created_at >= now() - INTERVAL '${mins} minutes'`);
+  return { clause: clauses.join(' AND ') };
+}
 
-  return `
+/** Shared SELECT block — conditions and params are appended safely */
+function buildTradesQuery({
+  scope,            // 'all' | 'token' | 'pool' | 'wallet'
+  scopeValue,       // token_id, pool_id, wallet, pair_contract (handled below)
+  includeLiquidity, // boolean
+  direction,        // 'buy' | 'sell' | 'provide' | 'withdraw' | null
+  windowOpts,       // {tf, from, to, days}
+  limit, offset
+}) {
+  const params = [];
+  const where = [];
+
+  // action filter
+  if (includeLiquidity) {
+    where.push(`t.action IN ('swap','provide','withdraw')`);
+  } else {
+    where.push(`t.action = 'swap'`);
+  }
+
+  // direction filter
+  if (direction) {
+    where.push(`t.direction = $${params.length + 1}`);
+    params.push(direction);
+  }
+
+  // scope filter
+  let scopeJoin = '';
+  if (scope === 'token') {
+    scopeJoin += ` JOIN tokens b ON b.token_id = p.base_token_id `;
+    where.push(`b.token_id = $${params.length + 1}`);
+    params.push(scopeValue); // token_id
+  } else if (scope === 'wallet') {
+    where.push(`t.signer = $${params.length + 1}`);
+    params.push(scopeValue); // address
+  } else if (scope === 'pool') {
+    // scopeValue can be { poolId } or { pairContract }
+    if (scopeValue.poolId) {
+      where.push(`p.pool_id = $${params.length + 1}`);
+      params.push(scopeValue.poolId);
+    } else if (scopeValue.pairContract) {
+      where.push(`p.pair_contract = $${params.length + 1}`);
+      params.push(scopeValue.pairContract);
+    }
+  }
+
+  // window
+  const { clause } = buildWindow(windowOpts, params);
+  where.push(clause);
+
+  const sql = `
     WITH base AS (
       SELECT
         t.*,
@@ -73,34 +130,33 @@ function makeSQL({ where, hasRangeOrDays, actionFilter, direction, extraJoins, e
         task.exponent AS ask_exp,
         COUNT(*) OVER() AS total
       FROM trades t
-      JOIN pools p   ON p.pool_id=t.pool_id
-      JOIN tokens q  ON q.token_id=p.quote_token_id
+      JOIN pools  p ON p.pool_id = t.pool_id
+      JOIN tokens q ON q.token_id = p.quote_token_id
+      ${scopeJoin}
       LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
       LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
-      ${extraJoins || ''}
-      WHERE ${actSQL} ${dirSQL}
-        ${extraWheres || ''}
-        ${timeSQL}
+      WHERE ${where.join(' AND ')}
       ORDER BY t.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     )
     SELECT * FROM base
   `;
+
+  return { sql, params };
 }
 
 function shapeRow(r, unit, zigUsd) {
   const offerScaled  = scale(r.offer_amount_base,  r.offer_exp,  r.offer_asset_denom === 'uzig' ? 6 : 6);
   const askScaled    = scale(r.ask_amount_base,    r.ask_exp,    r.ask_asset_denom   === 'uzig' ? 6 : 6);
-  const returnScaled = scale(r.return_amount_base, r.qexp, 6); // return is on quote side in xyk
+  const returnScaled = scale(r.return_amount_base, r.qexp, 6); // return is quote-side in xyk
 
   // Value in ZIG (quote side); convert if quote != uzig
   let valueZig = null;
   if (r.is_uzig_quote) {
-    // swaps: buy => offer is quote; sell => return is quote
     if (r.direction === 'buy')      valueZig = scale(r.offer_amount_base,  r.qexp, 6);
     else if (r.direction === 'sell')valueZig = scale(r.return_amount_base, r.qexp, 6);
-    else { // provide/withdraw: pick whichever leg is quote
-      // prefer non-null quote-side amount
+    else {
+      // provide/withdraw: pick whichever leg is quote
       valueZig = scale(
         (r.offer_asset_denom === 'uzig' ? r.offer_amount_base :
          r.ask_asset_denom   === 'uzig' ? r.ask_amount_base   :
@@ -117,10 +173,13 @@ function shapeRow(r, unit, zigUsd) {
           : (r.direction === 'sell'
               ? scale(r.return_amount_base, r.qexp, 6)
               : scale(
-                  (r.offer_asset_denom === r.ask_asset_denom  // try offer/ask first
+                  (r.offer_asset_denom === r.ask_asset_denom
                     ? r.offer_amount_base
-                    : (r.offer_asset_denom === r.ask_asset_denom ? r.ask_amount_base
-                      : (r.return_amount_base))), r.qexp, 6));
+                    : (r.offer_asset_denom === 'uzig' ? r.offer_amount_base
+                      : (r.ask_asset_denom === 'uzig' ? r.ask_amount_base
+                        : r.return_amount_base))),
+                  r.qexp, 6
+                ));
       valueZig = quoteAmt != null ? quoteAmt * qPrice : null;
     }
   }
@@ -136,12 +195,12 @@ function shapeRow(r, unit, zigUsd) {
     direction: r.direction,
     offerDenom: r.offer_asset_denom,
     offerAmountBase: r.offer_amount_base,
-    offerAmount: offerScaled,              // scaled
+    offerAmount: offerScaled,
     askDenom: r.ask_asset_denom,
     askAmountBase: r.ask_amount_base,
-    askAmount: askScaled,                  // scaled
+    askAmount: askScaled,
     returnAmountBase: r.return_amount_base,
-    returnAmount: returnScaled,            // scaled (quote)
+    returnAmount: returnScaled,
     valueNative: valueZig,
     valueUsd,
     class: klass
@@ -151,49 +210,37 @@ function shapeRow(r, unit, zigUsd) {
 /* ---------------- routes ---------------- */
 
 /** GET /trades
- *  Query:
- *   tf=1h|4h|24h|7d  OR  from=ISO&to=ISO  OR days=1..60
- *   unit=usd|zig
- *   class=shrimp|shark|whale
- *   direction=buy|sell|provide|withdraw
- *   includeLiquidity=1   (include provide/withdraw)
- *   limit, offset
+ *  tf=1h|4h|24h|7d OR from&to OR days=1..60
+ *  unit=usd|zig
+ *  class=shrimp|shark|whale
+ *  direction=buy|sell|provide|withdraw
+ *  includeLiquidity=1
+ *  limit, offset
  */
 router.get('/', async (req, res) => {
   try {
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = Math.min(Math.max(parseInt(req.query.limit || '500',10),1), 5000);
-    const offset = Math.max(parseInt(req.query.offset || '0',10), 0);
+    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:500 });
+    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
     const dir    = normDir(req.query.direction);
-    const actionFilter = req.query.includeLiquidity === '1' ? 'all' : 'swaps';
+    const includeLiquidity = req.query.includeLiquidity === '1';
 
     const zigUsd = await getZigUsd();
-    const { where, mode } = windowWhere({ tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days });
 
-    const sql = makeSQL({
-      where,
-      hasRangeOrDays: mode === 'range' ? 'range' : (mode === 'days' ? 'days' : 'rel'),
-      actionFilter,
+    const { sql, params } = buildTradesQuery({
+      scope: 'all',
+      includeLiquidity,
       direction: dir,
+      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
       limit, offset
-    }).replace('$DIR', dir ? `'${dir}'` : 'NULL')
-      .replace('$F', dir ? '$3' : '$2')
-      .replace('$T', dir ? '$4' : '$3')
-      .replace('$D', dir ? '$2' : '$1');
-
-    const params = [];
-    if (mode === 'range') {
-      if (dir) params.push(dir);
-      params.push(req.query.from, req.query.to);
-    } else if (mode === 'days') {
-      if (dir) params.push(dir);
-      params.push(String(Math.min(60, Math.max(1, parseInt(req.query.days||'1',10)))));
-    } else {
-      if (dir) params.push(dir);
-    }
+    });
 
     const { rows } = await DB.query(sql, params);
-    const data = rows.map(r => shapeRow(r, unit, zigUsd));
+    let data = rows.map(r => shapeRow(r, unit, zigUsd));
+
+    const klass = String(req.query.class || '').toLowerCase();
+    if (klass) data = data.filter(x => x.class === klass);
+
     const total = rows[0]?.total ? Number(rows[0].total) : data.length;
     res.json({ success:true, data, meta:{ unit, tf:req.query.tf||'24h', limit, offset, total } });
   } catch (e) {
@@ -201,42 +248,28 @@ router.get('/', async (req, res) => {
   }
 });
 
-/** GET /trades/token/:id  (same filters + pagination) */
+/** GET /trades/token/:id */
 router.get('/token/:id', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
     if (!tok) return res.status(404).json({ success:false, error:'token not found' });
 
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = Math.min(Math.max(parseInt(req.query.limit || '500',10),1), 5000);
-    const offset = Math.max(parseInt(req.query.offset || '0',10), 0);
+    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:500 });
+    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
     const dir    = normDir(req.query.direction);
-    const actionFilter = req.query.includeLiquidity === '1' ? 'all' : 'swaps';
+    const includeLiquidity = req.query.includeLiquidity === '1';
 
     const zigUsd = await getZigUsd();
-    const { where, mode } = windowWhere({ tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days });
 
-    const extraJoins  = `JOIN tokens b ON b.token_id=p.base_token_id`;
-    const extraWheres = `AND b.token_id=$B`;
-
-    const sql = makeSQL({
-      where,
-      hasRangeOrDays: mode === 'range' ? 'range' : (mode === 'days' ? 'days' : 'rel'),
-      actionFilter,
+    const { sql, params } = buildTradesQuery({
+      scope: 'token',
+      scopeValue: tok.token_id,
+      includeLiquidity,
       direction: dir,
-      extraJoins, extraWheres,
+      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
       limit, offset
-    })
-      .replace('$DIR', dir ? `'${dir}'` : 'NULL')
-      .replace('$B', dir ? '$3' : '$2')
-      .replace('$F', dir ? '$4' : '$3')
-      .replace('$T', dir ? '$5' : '$4')
-      .replace('$D', dir ? '$3' : '$2');
-
-    const params = [tok.token_id];
-    if (dir) params.unshift(dir); // direction first if present
-    if (mode === 'range') { params.push(req.query.from, req.query.to); }
-    if (mode === 'days')  { params.push(String(Math.min(60, Math.max(1, parseInt(req.query.days||'1',10))))); }
+    });
 
     const { rows } = await DB.query(sql, params);
     let data = rows.map(r => shapeRow(r, unit, zigUsd));
@@ -255,42 +288,29 @@ router.get('/token/:id', async (req, res) => {
 router.get('/pool/:ref', async (req, res) => {
   try {
     const ref = req.params.ref;
-
-    const pool = await DB.query(
+    const row = await DB.query(
       `SELECT pool_id, pair_contract FROM pools WHERE pair_contract=$1 OR pool_id::text=$1 LIMIT 1`,
       [ref]
     );
-    if (!pool.rows.length) return res.status(404).json({ success:false, error:'pool not found' });
+    if (!row.rows.length) return res.status(404).json({ success:false, error:'pool not found' });
+    const poolId = row.rows[0].pool_id;
 
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = Math.min(Math.max(parseInt(req.query.limit || '500',10),1), 5000);
-    const offset = Math.max(parseInt(req.query.offset || '0',10), 0);
+    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:500 });
+    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
     const dir    = normDir(req.query.direction);
-    const actionFilter = req.query.includeLiquidity === '1' ? 'all' : 'swaps';
+    const includeLiquidity = req.query.includeLiquidity === '1';
 
     const zigUsd = await getZigUsd();
-    const { where, mode } = windowWhere({ tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days });
 
-    const extraWheres = `AND p.pool_id=$PID`;
-
-    const sql = makeSQL({
-      where,
-      hasRangeOrDays: mode === 'range' ? 'range' : (mode === 'days' ? 'days' : 'rel'),
-      actionFilter,
+    const { sql, params } = buildTradesQuery({
+      scope: 'pool',
+      scopeValue: { poolId },
+      includeLiquidity,
       direction: dir,
-      extraWheres,
+      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
       limit, offset
-    })
-      .replace('$DIR', dir ? `'${dir}'` : 'NULL')
-      .replace('$PID', dir ? '$3' : '$2')
-      .replace('$F', dir ? '$4' : '$3')
-      .replace('$T', dir ? '$5' : '$4')
-      .replace('$D', dir ? '$3' : '$2');
-
-    const params = [pool.rows[0].pool_id];
-    if (dir) params.unshift(dir);
-    if (mode === 'range') { params.push(req.query.from, req.query.to); }
-    if (mode === 'days')  { params.push(String(Math.min(60, Math.max(1, parseInt(req.query.days||'1',10))))); }
+    });
 
     const { rows } = await DB.query(sql, params);
     let data = rows.map(r => shapeRow(r, unit, zigUsd));
@@ -305,59 +325,64 @@ router.get('/pool/:ref', async (req, res) => {
   }
 });
 
-/** GET /trades/wallet/:address  (filters + tokenId/pair/poolId) */
+/** GET /trades/wallet/:address */
 router.get('/wallet/:address', async (req, res) => {
   try {
-    const addr = req.params.address;
+    const address = req.params.address;
 
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = Math.min(Math.max(parseInt(req.query.limit || '1000',10),1), 5000);
-    const offset = Math.max(parseInt(req.query.offset || '0',10), 0);
+    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:1000 });
+    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0    });
     const dir    = normDir(req.query.direction);
-    const actionFilter = req.query.includeLiquidity === '1' ? 'all' : 'swaps';
+    const includeLiquidity = req.query.includeLiquidity === '1';
 
     const zigUsd = await getZigUsd();
-    const { where, mode } = windowWhere({ tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days });
 
-    let extraJoins = `JOIN tokens b ON b.token_id=p.base_token_id`;
-    let extraWheres = `AND t.signer=$WAL`;
-    const params = [addr];
-
+    // optional token/pair/pool scoping
+    let extras = { scope: 'wallet', scopeValue: address };
+    let joinExtra = '';
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
       if (tok) {
-        extraWheres += ` AND b.token_id=$TOK`;
-        params.push(tok.token_id);
+        extras.scope = 'token';         // reuse token scope and add wallet filter manually
+        extras.scopeValue = tok.token_id;
+        joinExtra = ` AND t.signer = $${1} `; // we’ll splice this below
       }
     }
 
-    if (req.query.pair) {
-      extraWheres += ` AND p.pair_contract=$PAIR`;
-      params.push(req.query.pair);
-    } else if (req.query.poolId) {
-      extraWheres += ` AND p.pool_id=$PID`;
-      params.push(req.query.poolId);
+    // build base
+    const built = buildTradesQuery({
+      scope: extras.scope,
+      scopeValue: extras.scopeValue,
+      includeLiquidity,
+      direction: dir,
+      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
+      limit, offset
+    });
+
+    // now tweak WHERE for wallet + (optional pair/pool)
+    // safer: wrap in subselect
+    const pair = req.query.pair;
+    const poolId = req.query.poolId;
+
+    let params = [];
+    let where2 = [`t.signer = $1`]; // always wallet filter
+
+    if (pair) {
+      where2.push(`p.pair_contract = $${params.length + 2}`);
+      params.push(pair);
+    } else if (poolId) {
+      where2.push(`p.pool_id = $${params.length + 2}`);
+      params.push(poolId);
     }
 
-    const sql = makeSQL({
-      where,
-      hasRangeOrDays: mode === 'range' ? 'range' : (mode === 'days' ? 'days' : 'rel'),
-      actionFilter,
-      direction: dir,
-      extraJoins, extraWheres,
-      limit, offset
-    })
-      .replace('$DIR', dir ? `'${dir}'` : 'NULL')
-      .replace('$WAL', '$1')
-      .replace('$TOK', params.length >= 2 ? `$${params.indexOf(params.find((_,i)=>i===1))+1}` : '$2')
-      .replace('$PAIR', `$${params.length - (mode==='range'?2:mode==='days'?1:0)}`)
-      .replace('$PID',  `$${params.length - (mode==='range'?2:mode==='days'?1:0)}`)
-      .replace('$F',    `$${params.length+1}`)
-      .replace('$T',    `$${params.length+2}`)
-      .replace('$D',    `$${params.length+1}`);
+    // recompose SQL using the same SELECT list, but replace WHERE with wallet-scope AND the original conditions
+    const sql = built.sql.replace(
+      /WHERE\s+(.+)\s+ORDER BY/s,
+      (m, old) => `WHERE ${where2.join(' AND ')} AND ${old} ORDER BY`
+    );
 
-    if (mode === 'range') { params.push(req.query.from, req.query.to); }
-    if (mode === 'days')  { params.push(String(Math.min(60, Math.max(1, parseInt(req.query.days||'1',10))))); }
+    params = [address, ...params, ...built.params];
 
     const { rows } = await DB.query(sql, params);
     const data = rows.map(r => shapeRow(r, unit, zigUsd));
