@@ -41,10 +41,23 @@ function scale(base, exp, fallback = 6) {
   return Number(base) / 10 ** e;
 }
 
+/** Expanded TF map (fixes missing 5d, plus more) */
 function minutesForTf(tf) {
-  const m = (tf || '').toLowerCase();
-  const map = { '1h':60, '4h':240, '24h':1440, '7d':10080 };
-  return map[m] || 1440;
+  const m = String(tf || '').toLowerCase();
+  const map = {
+    '30m': 30,
+    '1h' : 60,
+    '2h' : 120,
+    '4h' : 240,
+    '8h' : 480,
+    '12h': 720,
+    '24h': 1440,
+    '1d' : 1440,
+    '3d' : 4320,
+    '5d' : 7200,       // ← your case
+    '7d' : 10080
+  };
+  return map[m] || 1440; // default 24h
 }
 
 /** Build time window clause + params */
@@ -63,6 +76,7 @@ function buildWindow({ tf, from, to, days }, params) {
     params.push(String(d));
     return { clause: clauses.join(' AND ') };
   }
+  // tf fallback
   const mins = minutesForTf(tf);
   clauses.push(`t.created_at >= now() - INTERVAL '${mins} minutes'`);
   return { clause: clauses.join(' AND ') };
@@ -71,7 +85,7 @@ function buildWindow({ tf, from, to, days }, params) {
 /** Shared SELECT block — conditions and params are appended safely */
 function buildTradesQuery({
   scope,            // 'all' | 'token' | 'pool' | 'wallet'
-  scopeValue,       // token_id, pool_id, wallet, pair_contract (handled below)
+  scopeValue,       // token_id, {poolId}|{pairContract}, wallet
   includeLiquidity, // boolean
   direction,        // 'buy' | 'sell' | 'provide' | 'withdraw' | null
   windowOpts,       // {tf, from, to, days}
@@ -98,12 +112,11 @@ function buildTradesQuery({
   if (scope === 'token') {
     scopeJoin += ` JOIN tokens b ON b.token_id = p.base_token_id `;
     where.push(`b.token_id = $${params.length + 1}`);
-    params.push(scopeValue); // token_id
+    params.push(scopeValue); // token_id (bigint)
   } else if (scope === 'wallet') {
     where.push(`t.signer = $${params.length + 1}`);
-    params.push(scopeValue); // address
+    params.push(scopeValue); // address (text)
   } else if (scope === 'pool') {
-    // scopeValue can be { poolId } or { pairContract }
     if (scopeValue.poolId) {
       where.push(`p.pool_id = $${params.length + 1}`);
       params.push(scopeValue.poolId);
@@ -146,9 +159,10 @@ function buildTradesQuery({
 }
 
 function shapeRow(r, unit, zigUsd) {
+  // scaled legs
   const offerScaled  = scale(r.offer_amount_base,  r.offer_exp,  r.offer_asset_denom === 'uzig' ? 6 : 6);
   const askScaled    = scale(r.ask_amount_base,    r.ask_exp,    r.ask_asset_denom   === 'uzig' ? 6 : 6);
-  const returnScaled = scale(r.return_amount_base, r.qexp, 6); // return is quote-side in xyk
+  const returnScaled = scale(r.return_amount_base, r.qexp, 6); // quote side
 
   // Value in ZIG (quote side); convert if quote != uzig
   let valueZig = null;
@@ -156,7 +170,7 @@ function shapeRow(r, unit, zigUsd) {
     if (r.direction === 'buy')      valueZig = scale(r.offer_amount_base,  r.qexp, 6);
     else if (r.direction === 'sell')valueZig = scale(r.return_amount_base, r.qexp, 6);
     else {
-      // provide/withdraw: pick whichever leg is quote
+      // provide/withdraw: whichever leg is uzig, else fallback to return
       valueZig = scale(
         (r.offer_asset_denom === 'uzig' ? r.offer_amount_base :
          r.ask_asset_denom   === 'uzig' ? r.ask_amount_base   :
@@ -210,7 +224,7 @@ function shapeRow(r, unit, zigUsd) {
 /* ---------------- routes ---------------- */
 
 /** GET /trades
- *  tf=1h|4h|24h|7d OR from&to OR days=1..60
+ *  tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
  *  unit=usd|zig
  *  class=shrimp|shark|whale
  *  direction=buy|sell|provide|withdraw
@@ -264,7 +278,7 @@ router.get('/token/:id', async (req, res) => {
 
     const { sql, params } = buildTradesQuery({
       scope: 'token',
-      scopeValue: tok.token_id,
+      scopeValue: tok.token_id,  // bigint param (correct type)
       includeLiquidity,
       direction: dir,
       windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
@@ -325,6 +339,14 @@ router.get('/pool/:ref', async (req, res) => {
   }
 });
 
+/** GET /trades/wallet/:address
+ *  Window: tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
+ *  unit=usd|zig
+ *  direction=buy|sell|provide|withdraw
+ *  includeLiquidity=1
+ *  Optional scope: tokenId=<id|symbol|denom> OR pair=<pair_contract> OR poolId=<id>
+ *  Pagination: limit (<=5000), offset
+ */
 router.get('/wallet/:address', async (req, res) => {
   try {
     const address = req.params.address;
@@ -415,6 +437,7 @@ router.get('/wallet/:address', async (req, res) => {
     res.status(500).json({ success:false, error: e.message });
   }
 });
+
 /** GET /trades/large?bucket=30m|1h|4h|24h&unit=zig|usd&minValue=&maxValue= */
 router.get('/large', async (req, res) => {
   try {
