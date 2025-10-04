@@ -477,4 +477,102 @@ router.get('/large', async (req, res) => {
   }
 });
 
+
+/** GET /trades/recent
+ *  Lightweight “recent feed” for dashboards.
+ *  Filters:
+ *    - tokenId=<id|symbol|denom>  (optional; across all its pools)
+ *    - pair=<pair_contract>       (optional)
+ *    - poolId=<id>                (optional)
+ *    - direction=buy|sell|provide|withdraw (optional)
+ *    - includeLiquidity=1         (include LP provide/withdraw; default swaps only)
+ *    - unit=usd|zig               (default usd; used for size class + min/max filters)
+ *    - minValue=<number>, maxValue=<number>  (applied after value calc)
+ *    - tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d
+ *      OR from=<ISO>&to=<ISO> OR days=1..60
+ *    - limit (<=2000, default 200), offset (default 0)
+ */
+router.get('/recent', async (req, res) => {
+  try {
+    const unit   = String(req.query.unit || 'usd').toLowerCase();
+    const limit  = clampInt(req.query.limit,  { min:1, max:2000, def:200 });
+    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
+    const dir    = normDir(req.query.direction);
+    const includeLiquidity = req.query.includeLiquidity === '1';
+    const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
+    const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+
+    const zigUsd = await getZigUsd();
+
+    const where = [];
+    const params = [];
+
+    // action filter
+    if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
+    else where.push(`t.action = 'swap'`);
+
+    // optional direction
+    if (dir) {
+      where.push(`t.direction = $${params.length + 1}`);
+      params.push(dir);
+    }
+
+    // time window
+    const { clause: timeClause } = buildWindow(
+      { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
+      params
+    );
+    where.push(timeClause);
+
+    // optional scope: token / pair / pool
+    let extraJoin = '';
+    if (req.query.tokenId) {
+      const tok = await resolveTokenId(req.query.tokenId);
+      if (tok) {
+        extraJoin += ` JOIN tokens b ON b.token_id = p.base_token_id `;
+        where.push(`b.token_id = $${params.length + 1}`);
+        params.push(tok.token_id);
+      }
+    }
+    if (req.query.pair) {
+      where.push(`p.pair_contract = $${params.length + 1}`);
+      params.push(String(req.query.pair));
+    } else if (req.query.poolId) {
+      where.push(`p.pool_id = $${params.length + 1}`);
+      params.push(String(req.query.poolId));
+    }
+
+    const sql = `
+      SELECT
+        t.*,
+        p.pair_contract,
+        p.is_uzig_quote,
+        q.exponent AS qexp,
+        (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+        toff.exponent AS offer_exp,
+        task.exponent AS ask_exp
+      FROM trades t
+      JOIN pools  p ON p.pool_id = t.pool_id
+      JOIN tokens q ON q.token_id = p.quote_token_id
+      ${extraJoin}
+      LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
+      LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
+      WHERE ${where.join(' AND ')}
+      ORDER BY t.created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const { rows } = await DB.query(sql, params);
+    let data = rows.map(r => shapeRow(r, unit, zigUsd));
+
+    // optional min/max filter on computed value
+    if (minV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) >= minV);
+    if (maxV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) <= maxV);
+
+    res.json({ success:true, data, meta:{ unit, limit, offset, tf: req.query.tf || '24h', minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
+  } catch (e) {
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
+
 export default router;
