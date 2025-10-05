@@ -41,7 +41,7 @@ function scale(base, exp, fallback = 6) {
   return Number(base) / 10 ** e;
 }
 
-/** Expanded TF map (fixes missing 5d, plus more) */
+/** Expanded TF map */
 function minutesForTf(tf) {
   const m = String(tf || '').toLowerCase();
   const map = {
@@ -54,7 +54,7 @@ function minutesForTf(tf) {
     '24h': 1440,
     '1d' : 1440,
     '3d' : 4320,
-    '5d' : 7200,       // ← your case
+    '5d' : 7200,
     '7d' : 10080
   };
   return map[m] || 1440; // default 24h
@@ -95,11 +95,8 @@ function buildTradesQuery({
   const where = [];
 
   // action filter
-  if (includeLiquidity) {
-    where.push(`t.action IN ('swap','provide','withdraw')`);
-  } else {
-    where.push(`t.action = 'swap'`);
-  }
+  if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
+  else where.push(`t.action = 'swap'`);
 
   // direction filter
   if (direction) {
@@ -107,15 +104,13 @@ function buildTradesQuery({
     params.push(direction);
   }
 
-  // scope filter
-  let scopeJoin = '';
+  // scope filter (we always join base token `b` below)
   if (scope === 'token') {
-    scopeJoin += ` JOIN tokens b ON b.token_id = p.base_token_id `;
     where.push(`b.token_id = $${params.length + 1}`);
-    params.push(scopeValue); // token_id (bigint)
+    params.push(scopeValue); // token_id (BIGINT)
   } else if (scope === 'wallet') {
     where.push(`t.signer = $${params.length + 1}`);
-    params.push(scopeValue); // address (text)
+    params.push(scopeValue); // address
   } else if (scope === 'pool') {
     if (scopeValue.poolId) {
       where.push(`p.pool_id = $${params.length + 1}`);
@@ -136,16 +131,30 @@ function buildTradesQuery({
         t.*,
         p.pair_contract,
         p.is_uzig_quote,
+
+        -- quote token (right side of pair)
         q.exponent AS qexp,
-        -- latest price of QUOTE token in ZIG (needed when pair is NOT uzig-quoted)
-        (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+
+        -- base token (left side of pair) — used to compute price per BASE
+        b.exponent AS bexp,
+        b.denom    AS base_denom,
+
+        -- latest price of QUOTE token in ZIG (when quote != uzig)
+        (SELECT price_in_zig
+           FROM prices
+          WHERE token_id = p.quote_token_id
+          ORDER BY updated_at DESC
+          LIMIT 1) AS pq_price_in_zig,
+
+        -- exponents of the trade legs
         toff.exponent AS offer_exp,
         task.exponent AS ask_exp,
+
         COUNT(*) OVER() AS total
       FROM trades t
       JOIN pools  p ON p.pool_id = t.pool_id
       JOIN tokens q ON q.token_id = p.quote_token_id
-      ${scopeJoin}
+      JOIN tokens b ON b.token_id = p.base_token_id
       LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
       LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
       WHERE ${where.join(' AND ')}
@@ -158,47 +167,88 @@ function buildTradesQuery({
   return { sql, params };
 }
 
+/** shape a trade row + compute value + per-trade price (ZIG per BASE) */
 function shapeRow(r, unit, zigUsd) {
-  // scaled legs
-  const offerScaled  = scale(r.offer_amount_base,  r.offer_exp,  r.offer_asset_denom === 'uzig' ? 6 : 6);
-  const askScaled    = scale(r.ask_amount_base,    r.ask_exp,    r.ask_asset_denom   === 'uzig' ? 6 : 6);
-  const returnScaled = scale(r.return_amount_base, r.qexp, 6); // quote side
+  // scaled legs for response
+  const offerScaled = scale(
+    r.offer_amount_base,
+    (r.offer_asset_denom === 'uzig') ? 6 : (r.offer_exp ?? 6),
+    6
+  );
 
-  // Value in ZIG (quote side); convert if quote != uzig
+  const askScaled = scale(
+    r.ask_amount_base,
+    (r.ask_asset_denom === 'uzig') ? 6 : (r.ask_exp ?? 6),
+    6
+  );
+
+  // Two interpretations of return_amount_base
+  const returnAsQuote = scale(r.return_amount_base, r.qexp ?? 6, 6); // quote units
+  const returnAsBase  = scale(r.return_amount_base, r.bexp ?? 6, 6); // base units
+
+  // ------------------------------
+  // Notional value in ZIG (quote)
+  // ------------------------------
   let valueZig = null;
   if (r.is_uzig_quote) {
-    if (r.direction === 'buy')      valueZig = scale(r.offer_amount_base,  r.qexp, 6);
-    else if (r.direction === 'sell')valueZig = scale(r.return_amount_base, r.qexp, 6);
-    else {
-      // provide/withdraw: whichever leg is uzig, else fallback to return
-      valueZig = scale(
-        (r.offer_asset_denom === 'uzig' ? r.offer_amount_base :
-         r.ask_asset_denom   === 'uzig' ? r.ask_amount_base   :
-                                           r.return_amount_base),
-        r.qexp, 6
-      );
+    if (r.direction === 'buy') {
+      valueZig = scale(r.offer_amount_base, r.qexp ?? 6, 6);  // paid quote
+    } else if (r.direction === 'sell') {
+      valueZig = scale(r.return_amount_base, r.qexp ?? 6, 6); // received quote
+    } else {
+      valueZig = (r.offer_asset_denom === 'uzig')
+        ? scale(r.offer_amount_base, r.qexp ?? 6, 6)
+        : (r.ask_asset_denom === 'uzig')
+          ? scale(r.ask_amount_base, r.qexp ?? 6, 6)
+          : returnAsQuote;
     }
   } else {
     const qPrice = r.pq_price_in_zig != null ? Number(r.pq_price_in_zig) : null;
     if (qPrice != null) {
       const quoteAmt =
-        r.direction === 'buy'
-          ? scale(r.offer_amount_base,  r.qexp, 6)
-          : (r.direction === 'sell'
-              ? scale(r.return_amount_base, r.qexp, 6)
-              : scale(
-                  (r.offer_asset_denom === r.ask_asset_denom
-                    ? r.offer_amount_base
-                    : (r.offer_asset_denom === 'uzig' ? r.offer_amount_base
-                      : (r.ask_asset_denom === 'uzig' ? r.ask_amount_base
-                        : r.return_amount_base))),
-                  r.qexp, 6
-                ));
+        (r.direction === 'buy')
+          ? scale(r.offer_amount_base,  r.qexp ?? 6, 6)   // paid quote
+          : scale(r.return_amount_base, r.qexp ?? 6, 6);  // received quote
       valueZig = quoteAmt != null ? quoteAmt * qPrice : null;
     }
   }
-
   const valueUsd = valueZig != null ? valueZig * zigUsd : null;
+
+  // ----------------------------------------
+  // Execution PRICE: ZIG per 1 BASE token
+  // ----------------------------------------
+  // base amount:
+  const baseAmt = (r.direction === 'buy')
+    ? returnAsBase                             // received base
+    : (r.direction === 'sell')
+      ? scale(r.offer_amount_base, r.bexp ?? 6, 6) // offered base
+      : null;
+
+  // quote amount in ZIG:
+  let quoteAmtZig = null;
+  if (r.is_uzig_quote) {
+    quoteAmtZig = (r.direction === 'buy')
+      ? scale(r.offer_amount_base,  r.qexp ?? 6, 6)   // paid quote
+      : (r.direction === 'sell')
+        ? scale(r.return_amount_base, r.qexp ?? 6, 6) // received quote
+        : null;
+  } else {
+    const qPrice = r.pq_price_in_zig != null ? Number(r.pq_price_in_zig) : null;
+    if (qPrice != null) {
+      const rawQuote = (r.direction === 'buy')
+        ? scale(r.offer_amount_base,  r.qexp ?? 6, 6)
+        : (r.direction === 'sell')
+          ? scale(r.return_amount_base, r.qexp ?? 6, 6)
+          : null;
+      if (rawQuote != null) quoteAmtZig = rawQuote * qPrice;
+    }
+  }
+
+  const priceNative = (quoteAmtZig != null && baseAmt != null && baseAmt !== 0)
+    ? (quoteAmtZig / baseAmt)   // ZIG per 1 BASE
+    : null;
+  const priceUsd = priceNative != null ? priceNative * zigUsd : null;
+
   const klass = classify(unit === 'usd' ? valueUsd : valueZig, unit);
 
   return {
@@ -207,16 +257,27 @@ function shapeRow(r, unit, zigUsd) {
     pairContract: r.pair_contract,
     signer: r.signer,
     direction: r.direction,
+
     offerDenom: r.offer_asset_denom,
     offerAmountBase: r.offer_amount_base,
     offerAmount: offerScaled,
+
     askDenom: r.ask_asset_denom,
     askAmountBase: r.ask_amount_base,
     askAmount: askScaled,
+
     returnAmountBase: r.return_amount_base,
-    returnAmount: returnScaled,
+    // For BUY this is base; for SELL this is quote
+    returnAmount: (r.direction === 'buy') ? returnAsBase : returnAsQuote,
+
+    // per-trade execution price
+    priceNative,     // ZIG per 1 BASE
+    priceUsd,        // USD per 1 BASE
+
+    // trade notional
     valueNative: valueZig,
     valueUsd,
+
     class: klass
   };
 }
@@ -278,7 +339,7 @@ router.get('/token/:id', async (req, res) => {
 
     const { sql, params } = buildTradesQuery({
       scope: 'token',
-      scopeValue: tok.token_id,  // bigint param (correct type)
+      scopeValue: tok.token_id,  // BIGINT
       includeLiquidity,
       direction: dir,
       windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
@@ -358,39 +419,33 @@ router.get('/wallet/:address', async (req, res) => {
 
     const zigUsd = await getZigUsd();
 
-    // ---- Build WHERE + params safely (no placeholder collisions) ----
+    // WHERE + params (no duplicate joins)
     const where = [];
     const params = [];
 
-    // scope: wallet
     where.push(`t.signer = $${params.length + 1}`);
     params.push(address);
 
-    // action filter
     if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
     else where.push(`t.action = 'swap'`);
 
-    // optional direction
     if (dir) {
       where.push(`t.direction = $${params.length + 1}`);
       params.push(dir);
     }
 
-    // time window
     const { clause: timeClause } = buildWindow(
       { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
       params
     );
     where.push(timeClause);
 
-    // optional scoping by token / pair / pool
-    let extraJoin = ''; // add JOIN tokens b (base) only if token filter present
+    // optional scoping by token / pair / pool (use alias b already present in SELECT)
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
       if (tok) {
-        extraJoin += ` JOIN tokens b ON b.token_id = p.base_token_id `;
         where.push(`b.token_id = $${params.length + 1}`);
-        params.push(tok.token_id); // BIGINT param, matches column type
+        params.push(tok.token_id);
       }
     }
 
@@ -409,7 +464,8 @@ router.get('/wallet/:address', async (req, res) => {
           p.pair_contract,
           p.is_uzig_quote,
           q.exponent AS qexp,
-          -- latest price of QUOTE token in ZIG (when quote != uzig)
+          b.exponent AS bexp,
+          b.denom    AS base_denom,
           (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
           toff.exponent AS offer_exp,
           task.exponent AS ask_exp,
@@ -417,7 +473,7 @@ router.get('/wallet/:address', async (req, res) => {
         FROM trades t
         JOIN pools  p ON p.pool_id = t.pool_id
         JOIN tokens q ON q.token_id = p.quote_token_id
-        ${extraJoin}
+        JOIN tokens b ON b.token_id = p.base_token_id
         LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
         LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
         WHERE ${where.join(' AND ')}
@@ -428,7 +484,6 @@ router.get('/wallet/:address', async (req, res) => {
     `;
 
     const { rows } = await DB.query(sql, params);
-
     const data = rows.map(r => shapeRow(r, unit, zigUsd));
     const total = rows[0]?.total ? Number(rows[0].total) : data.length;
 
@@ -477,20 +532,18 @@ router.get('/large', async (req, res) => {
   }
 });
 
-
 /** GET /trades/recent
- *  Lightweight “recent feed” for dashboards.
+ *  Dashboard feed.
  *  Filters:
  *    - tokenId=<id|symbol|denom>  (optional; across all its pools)
  *    - pair=<pair_contract>       (optional)
  *    - poolId=<id>                (optional)
  *    - direction=buy|sell|provide|withdraw (optional)
- *    - includeLiquidity=1         (include LP provide/withdraw; default swaps only)
- *    - unit=usd|zig               (default usd; used for size class + min/max filters)
- *    - minValue=<number>, maxValue=<number>  (applied after value calc)
- *    - tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d
- *      OR from=<ISO>&to=<ISO> OR days=1..60
- *    - limit (<=2000, default 200), offset (default 0)
+ *    - includeLiquidity=1
+ *    - unit=usd|zig
+ *    - minValue, maxValue
+ *    - tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
+ *    - limit (<=2000, default 200), offset
  */
 router.get('/recent', async (req, res) => {
   try {
@@ -507,29 +560,24 @@ router.get('/recent', async (req, res) => {
     const where = [];
     const params = [];
 
-    // action filter
     if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
     else where.push(`t.action = 'swap'`);
 
-    // optional direction
     if (dir) {
       where.push(`t.direction = $${params.length + 1}`);
       params.push(dir);
     }
 
-    // time window
     const { clause: timeClause } = buildWindow(
       { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
       params
     );
     where.push(timeClause);
 
-    // optional scope: token / pair / pool
-    let extraJoin = '';
+    // optional scope: token / pair / pool (use alias b already present in SELECT)
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
       if (tok) {
-        extraJoin += ` JOIN tokens b ON b.token_id = p.base_token_id `;
         where.push(`b.token_id = $${params.length + 1}`);
         params.push(tok.token_id);
       }
@@ -548,13 +596,15 @@ router.get('/recent', async (req, res) => {
         p.pair_contract,
         p.is_uzig_quote,
         q.exponent AS qexp,
+        b.exponent AS bexp,
+        b.denom    AS base_denom,
         (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
         toff.exponent AS offer_exp,
         task.exponent AS ask_exp
       FROM trades t
       JOIN pools  p ON p.pool_id = t.pool_id
       JOIN tokens q ON q.token_id = p.quote_token_id
-      ${extraJoin}
+      JOIN tokens b ON b.token_id = p.base_token_id
       LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
       LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
       WHERE ${where.join(' AND ')}
@@ -565,7 +615,6 @@ router.get('/recent', async (req, res) => {
     const { rows } = await DB.query(sql, params);
     let data = rows.map(r => shapeRow(r, unit, zigUsd));
 
-    // optional min/max filter on computed value
     if (minV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) >= minV);
     if (maxV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) <= maxV);
 
