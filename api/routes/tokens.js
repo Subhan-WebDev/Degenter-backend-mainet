@@ -191,7 +191,7 @@ router.get('/:id', async (req, res) => {
       FROM tokens WHERE token_id=$1
     `, [tok.token_id]);
     const s = srow.rows[0] || {};
-    const exp = Number(s.exponent || 6);
+    const exp = s.exponent != null ? Number(s.exponent) : 6;
     const circ = disp(s.total_supply_base, exp);
     const max  = disp(s.max_supply_base, exp);
 
