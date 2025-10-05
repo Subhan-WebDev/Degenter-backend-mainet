@@ -4,6 +4,8 @@ import { DB } from '../../lib/db.js';
 import { resolveTokenId, getZigUsd } from '../util/resolve-token.js';
 import { resolvePoolSelection, changePctForMinutes } from '../util/pool-select.js';
 import { getCandles, ensureTf } from '../util/ohlcv-agg.js';
+import e from 'express';
+import log from '../../lib/log.js';
 
 const router = express.Router();
 const toNum = x => (x == null ? null : Number(x));
@@ -682,9 +684,8 @@ router.get('/:id/ohlcv', async (req, res) => {
 
     // supply (for mcap)
     const ss = await DB.query(`SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
-    const exp = ss.exponent != null ? Number(ss.exponent) : 6;
+    const exp = ss.rows[0]?.exponent!= null ? Number(ss.rows[0]?.exponent) : 6;
     const circ = ss.rows[0]?.total_supply_base != null ? Number(ss.rows[0].total_supply_base) / 10**exp : null;
-
     // resolve pool set:
     let headerSQL = ``;
     let params = [];
