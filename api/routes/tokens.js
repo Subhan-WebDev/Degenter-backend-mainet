@@ -346,7 +346,7 @@ router.get('/:id/pools', async (req, res) => {
 
     const header = await DB.query(`SELECT token_id, symbol, denom, image_uri, total_supply_base, max_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
     const h = header.rows[0];
-    const exp = Number(h.exponent || 6);
+    const exp = h.exponent != null ? Number(h.exponent) : 6;
     const circ = disp(h.total_supply_base, exp);
     const max  = disp(h.max_supply_base, exp);
 
@@ -419,7 +419,7 @@ router.get('/:id/holders', async (req, res) => {
     const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
 
     const sup = await DB.query(`SELECT max_supply_base, total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
-    const exp = Number(sup.rows[0]?.exponent || 6);
+    const exp = sup.exponent != null ? Number(sup.exponent) : 6;
     const maxBase = Number(sup.rows[0]?.max_supply_base || 0);
     const totBase = Number(sup.rows[0]?.total_supply_base || 0);
 
@@ -453,46 +453,163 @@ router.get('/:id/holders', async (req, res) => {
 /* =======================================================================
    GET /tokens/:id/security  (use public.token_security)
    ======================================================================= */
+/** GET /tokens/:id/security
+ * Uses only columns from your token_security schema.
+ * Returns:
+ *  - score (0..100) with transparent penalties/bonuses
+ *  - checks  (stable, flat keys)
+ *  - dev     (birdeye-like details you track)
+ */
 router.get('/:id/security', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
     if (!tok) return res.status(404).json({ success:false, error:'token not found' });
 
-    const r = await DB.query(`SELECT * FROM public.token_security WHERE token_id=$1 LIMIT 1`, [tok.token_id]);
-    const s = r.rows[0] || null;
+    // Pull security row
+    const sq = await DB.query(`
+      SELECT
+        token_id,
+        denom,
+        is_mintable,
+        can_change_minting_cap,
+        max_supply_base,
+        total_supply_base,
+        creator_address,
+        creator_balance_base,
+        creator_pct_of_max,
+        top10_pct_of_max,
+        holders_count,
+        first_seen_at,
+        checked_at
+      FROM public.token_security
+      WHERE token_id=$1
+      LIMIT 1
+    `, [tok.token_id]);
+    const s = sq.rows[0] || null;
 
-    const sup = await DB.query(`SELECT max_supply_base, total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
-    const exp = Number(sup.rows[0]?.exponent || 6);
-    const maxBase = Number(sup.rows[0]?.max_supply_base || 0);
-    const totBase = Number(sup.rows[0]?.total_supply_base || 0);
+    // Always get exponent from tokens for display scaling
+    const tq = await DB.query(
+      `SELECT exponent, created_at FROM public.tokens WHERE token_id=$1`,
+      [tok.token_id]
+    );
+    const exp = tq.rows[0]?.exponent != null ? Number(tq.rows[0]?.exponent) : 6;
+    // Helpers
+    const toDisp = (v) => v == null ? null : Number(v) / 10 ** exp;
+    const num = (v, d = 0) => v == null ? d : Number(v);
 
-    // score (simple aggregation over checks; tweak as you wish)
-    let score = 20;
-    if (s?.contract_verified) score += 12;
-    if (s?.owner_renounced)   score += 10;
-    if (s?.liquidity_lock_pct >= 75) score += 10;
-    if ((s?.buy_tax_bps ?? 0) <= 500 && (s?.sell_tax_bps ?? 0) <= 500) score += 12;
+    // Derived display values
+    const maxSupplyDisp   = toDisp(s?.max_supply_base);
+    const totalSupplyDisp = toDisp(s?.total_supply_base);
+    const creatorBalDisp  = toDisp(s?.creator_balance_base);
+
+    const creatorPctOfMax = num(s?.creator_pct_of_max, 0); // %
+    const top10PctOfMax   = num(s?.top10_pct_of_max, 0);   // %
+    const holdersCount    = num(s?.holders_count, 0);
+
+    // --------- Scoring (only what you actually track) ----------
+    // Start at 100, subtract penalties, add bonuses, clamp 1..99
+    const penalties = [];
+    const bonuses   = [];
+
+    // Mintability / supply mutability
+    if (s?.is_mintable === true) {
+      penalties.push({k:'is_mintable', pts:12});
+    } else {
+      bonuses.push({k:'not_mintable', pts:4});
+    }
+
+    if (s?.can_change_minting_cap === true) {
+      penalties.push({k:'can_change_minting_cap', pts:8});
+    }
+
+    // Distribution concentration (top10 of max supply)
+    if (top10PctOfMax >= 75) penalties.push({k:'top10>=75%', pts:20});
+    else if (top10PctOfMax >= 50) penalties.push({k:'top10>=50%', pts:12});
+    else if (top10PctOfMax >= 30) penalties.push({k:'top10>=30%', pts:6});
+    else bonuses.push({k:'top10<30%', pts:4});
+
+    // Creator concentration (of max supply)
+    if (creatorPctOfMax >= 25) penalties.push({k:'creator>=25%', pts:18});
+    else if (creatorPctOfMax >= 10) penalties.push({k:'creator>=10%', pts:10});
+    else if (creatorPctOfMax > 0) bonuses.push({k:'creator<10%', pts:3});
+
+    // Holder base
+    if (holdersCount < 100) penalties.push({k:'holders<100', pts:8});
+    else if (holdersCount < 1000) penalties.push({k:'holders<1k', pts:4});
+    else if (holdersCount >= 10000) bonuses.push({k:'holders>=10k', pts:5});
+    else if (holdersCount >= 50000) bonuses.push({k:'holders>=50k', pts:10}); // rare bonus
+
+    // Supply fully minted bonus
+    if (s?.is_mintable === false && s?.max_supply_base != null && s?.total_supply_base != null) {
+      if (String(s.max_supply_base) === String(s.total_supply_base)) {
+        bonuses.push({k:'fully_minted_equals_max', pts:4});
+      }
+    }
+
+    // Age bonus (first_seen_at older than 30d)
+    const firstSeen = s?.first_seen_at ? new Date(s.first_seen_at) : null;
+    if (firstSeen) {
+      const daysAlive = (Date.now() - firstSeen.getTime()) / (1000*60*60*24);
+      if (daysAlive >= 180) bonuses.push({k:'age>=180d', pts:6});
+      else if (daysAlive >= 90) bonuses.push({k:'age>=90d', pts:4});
+      else if (daysAlive >= 30) bonuses.push({k:'age>=30d', pts:2});
+    }
+
+    let score = 100;
+    for (const p of penalties) score -= p.pts;
+    for (const b of bonuses)   score += b.pts;
     score = Math.max(1, Math.min(99, Math.round(score)));
+
+    // ---------- Response shape ----------
+    const checks = {
+      // flat & explicit (good for UI badges)
+      isMintable: !!(s?.is_mintable),
+      canChangeMintingCap: !!(s?.can_change_minting_cap),
+      maxSupply: maxSupplyDisp,
+      totalSupply: totalSupplyDisp,
+      top10PctOfMax: Number(top10PctOfMax.toFixed(4)),
+      creatorPctOfMax: Number(creatorPctOfMax.toFixed(4)),
+      holdersCount: holdersCount
+    };
+
+    const dev = {
+      // birdeye-like details you actually store
+      tokenTotalSupply: totalSupplyDisp,
+      creatorAddress: s?.creator_address || null,
+      creatorBalance: creatorBalDisp,
+      creatorPctOfMax: Number(creatorPctOfMax.toFixed(4)),
+      topHoldersPctOfMax: Number(top10PctOfMax.toFixed(4)),
+      holdersCount: holdersCount,
+      firstSeenAt: s?.first_seen_at || null
+    };
+
+    const categories = {
+      supply: {
+        isMintable: !!(s?.is_mintable),
+        canChangeMintingCap: !!(s?.can_change_minting_cap),
+        maxSupply: maxSupplyDisp,
+        totalSupply: totalSupplyDisp
+      },
+      distribution: {
+        top10PctOfMax: Number(top10PctOfMax.toFixed(4)),
+        creatorPctOfMax: Number(creatorPctOfMax.toFixed(4))
+      },
+      adoption: {
+        holdersCount: holdersCount,
+        firstSeenAt: s?.first_seen_at || null
+      }
+    };
 
     res.json({
       success: true,
       data: {
         score,
-        checks: {
-          contractVerified: !!(s?.contract_verified),
-          buyTaxBps: Number(s?.buy_tax_bps ?? 0),
-          sellTaxBps: Number(s?.sell_tax_bps ?? 0),
-          proxy: !!(s?.proxy_contract),
-          mintable: s?.mintable ?? (totBase !== maxBase),
-          owner: s?.owner ?? null,
-          ownerRenounced: !!(s?.owner_renounced),
-          liquidityLockPct: Number(s?.liquidity_lock_pct ?? 0),
-          top10Pct: Number(s?.top10_pct ?? 0),
-          creatorPct: Number(s?.creator_pct ?? 0),
-          maxSupply: maxBase / (10 ** exp),
-          totalSupply: totBase / (10 ** exp)
-        },
-        lastUpdated: s?.updated_at || s?.inserted_at || null,
+        penalties,
+        bonuses,
+        categories,
+        checks,   // backwards-friendly, simple keys
+        dev,      // for a “Dev / Ownership” panel
+        lastUpdated: s?.checked_at || null,
         source: 'token_security'
       }
     });
@@ -500,6 +617,7 @@ router.get('/:id/security', async (req, res) => {
     res.status(500).json({ success:false, error: e.message });
   }
 });
+
 
 /* =======================================================================
    GET /tokens/:id/ohlcv  (delegates to util; supports fill; no GROUP BY errors)
@@ -564,7 +682,7 @@ router.get('/:id/ohlcv', async (req, res) => {
 
     // supply (for mcap)
     const ss = await DB.query(`SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
-    const exp = Number(ss.rows[0]?.exponent || 6);
+    const exp = ss.exponent != null ? Number(ss.exponent) : 6;
     const circ = ss.rows[0]?.total_supply_base != null ? Number(ss.rows[0].total_supply_base) / 10**exp : null;
 
     // resolve pool set:
