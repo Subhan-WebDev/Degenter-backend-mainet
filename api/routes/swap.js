@@ -31,7 +31,7 @@ async function resolveRef(ref) {
  */
 async function pickBestBuyPool(tokenId) {
   const prices = await DB.query(`
-    SELECT pr.pool_id, pr.price_in_zig, pr.updated_at, p.pair_contract
+    SELECT pr.pool_id, pr.price_in_zig, pr.updated_at, p.pair_contract, p.pair_type
     FROM prices pr
     JOIN pools p ON p.pool_id=pr.pool_id
     WHERE pr.token_id=$1 AND p.is_uzig_quote=TRUE
@@ -59,6 +59,7 @@ async function pickBestBuyPool(tokenId) {
   return {
     poolId: String(top.pool_id),
     pairContract: top.pair_contract,
+    pairType: top.pair_type,
     priceInZig: Number(top.price_in_zig)
   };
 }
@@ -68,7 +69,7 @@ async function pickBestBuyPool(tokenId) {
  */
 async function pickBestSellPool(tokenId) {
   const prices = await DB.query(`
-    SELECT pr.pool_id, pr.price_in_zig, pr.updated_at, p.pair_contract
+    SELECT pr.pool_id, pr.price_in_zig, pr.updated_at, p.pair_contract, p.pair_type
     FROM prices pr
     JOIN pools p ON p.pool_id=pr.pool_id
     WHERE pr.token_id=$1 AND p.is_uzig_quote=TRUE
@@ -96,6 +97,7 @@ async function pickBestSellPool(tokenId) {
   return {
     poolId: String(top.pool_id),
     pairContract: top.pair_contract,
+    pairType: top.pair_type,
     priceInZig: Number(top.price_in_zig)
   };
 }
@@ -141,7 +143,7 @@ router.get('/', async (req, res) => {
         success: true,
         data: {
           route: ['uzig', to.token.denom || to.token.symbol || String(to.token.token_id)],
-          pairs: [{ poolId: best.poolId, pairContract: best.pairContract }],
+          pairs: [{ poolId: best.poolId, pairContract: best.pairContract , pairType: best.pairType }],
           price_native: priceNative,
           price_usd: priceUsd,
           source: 'direct_uzig',
@@ -162,7 +164,7 @@ router.get('/', async (req, res) => {
         success: true,
         data: {
           route: [from.token.denom || from.token.symbol || String(from.token.token_id), 'uzig'],
-          pairs: [{ poolId: best.poolId, pairContract: best.pairContract }],
+          pairs: [{ poolId: best.poolId, pairContract: best.pairContract, pairType: best.pairType }],
           price_native: priceNative,
           price_usd: priceUsd,
           source: 'direct_uzig',
@@ -228,8 +230,8 @@ router.get('/', async (req, res) => {
           price_usd: null, // undefined for token-to-token; keep null unless you want to convert to USD via B's zig (needs extra step)
           source: 'via_uzig',
           diagnostics: {
-            sell_leg: { side: 'sell', token_id: from.token.token_id, poolId: sellA.poolId, price_in_zig: sellA.priceInZig },
-            buy_leg:  { side: 'buy',  token_id: to.token.token_id,   poolId: buyB.poolId,  price_in_zig: buyB.priceInZig  },
+            sell_leg: { side: 'sell', token_id: from.token.token_id, poolId: sellA.poolId, price_in_zig: sellA.priceInZig, pairType: sellA.pairType },
+            buy_leg:  { side: 'buy',  token_id: to.token.token_id,   poolId: buyB.poolId,  price_in_zig: buyB.priceInZig, pairType: buyB.pairType },
             formula: 'B_per_A = price_sell_A / price_buy_B'
           }
         }

@@ -120,13 +120,13 @@ router.get('/swap-list', async (req, res) => {
         SELECT p.base_token_id AS token_id,
                SUM(pm.vol_buy_zig + pm.vol_sell_zig) AS vol_zig,
                SUM(pm.tx_buy + pm.tx_sell) AS tx,
-               SUM(pm.tvl_zig) AS tvl_zig
+               SUM(pm.tvl_zig) AS tvl_zig  
         FROM pool_matrix pm
         JOIN pools p ON p.pool_id=pm.pool_id
         WHERE pm.bucket=$1
         GROUP BY p.base_token_id
       )
-      SELECT t.token_id, t.symbol, t.name, t.denom, t.image_uri,
+      SELECT t.token_id, t.symbol, t.name, t.denom, t.image_uri, t.exponent,
              tm.price_in_zig, tm.mcap_zig, tm.fdv_zig,
              a.vol_zig, a.tx, a.tvl_zig
       FROM tokens t
@@ -145,6 +145,7 @@ router.get('/swap-list', async (req, res) => {
       return {
         tokenId: r.token_id,
         symbol: r.symbol,
+        exponent:r.exponent,
         name: r.name,
         denom: r.denom,
         imageUri: r.image_uri,
