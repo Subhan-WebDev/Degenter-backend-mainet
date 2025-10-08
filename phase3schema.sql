@@ -409,3 +409,68 @@ CREATE TABLE IF NOT EXISTS ohlcv_1m_default
 
 ALTER TABLE public.tokens
   ADD COLUMN IF NOT EXISTS description TEXT;
+
+
+-- 0) Handle normalizer (idempotent)
+CREATE OR REPLACE FUNCTION public.norm_twitter_handle(in_raw TEXT)
+RETURNS TEXT
+LANGUAGE sql IMMUTABLE STRICT AS $$
+SELECT lower(
+    regexp_replace(
+        regexp_replace(
+            regexp_replace(
+                coalesce(in_raw, ''),
+                '^(https?://)?(www\.)?(x|twitter)\.com/', 
+                '', 'i'
+            ), 
+            '^@', '', 'i'
+        ), 
+        '[/\?\#].*$', '', 'g'
+    )
+);
+$$;
+
+-- 1) Optional: index on normalized handle inside tokens (fast lookups)
+CREATE INDEX IF NOT EXISTS idx_tokens_twitter_handle 
+ON public.tokens (public.norm_twitter_handle(twitter));
+
+-- 2) TOKEN TWITTER table (1 row per token)
+CREATE TABLE IF NOT EXISTS public.token_twitter (
+    token_id BIGINT PRIMARY KEY 
+        REFERENCES public.tokens(token_id) 
+        ON DELETE CASCADE,
+    handle TEXT NOT NULL, -- normalized @username
+    user_id TEXT, -- Twitter user id
+    profile_url TEXT,
+    name TEXT,
+    is_blue_verified BOOLEAN,
+    verified_type TEXT,
+    profile_picture TEXT,
+    cover_picture TEXT,
+    description TEXT,
+    location TEXT,
+    followers BIGINT,
+    following BIGINT,
+    favourites_count BIGINT,
+    statuses_count BIGINT,
+    media_count BIGINT,
+    can_dm BOOLEAN,
+    created_at_twitter TIMESTAMPTZ,
+    possibly_sensitive BOOLEAN,
+    is_automated BOOLEAN,
+    automated_by TEXT,
+    pinned_tweet_ids TEXT[], -- Array of pinned tweet IDs
+    unavailable BOOLEAN,
+    unavailable_message TEXT,
+    unavailable_reason TEXT,
+    raw JSONB, -- full payload (future-proofing)
+    last_refreshed TIMESTAMPTZ NOT NULL DEFAULT now(), -- last successful refresh
+    last_error TEXT,
+    last_error_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_twitter_handle 
+ON public.token_twitter(handle);
+
+CREATE INDEX IF NOT EXISTS idx_token_twitter_last_refreshed 
+ON public.token_twitter(last_refreshed DESC);
