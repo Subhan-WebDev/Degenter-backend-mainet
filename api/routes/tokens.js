@@ -169,9 +169,6 @@ router.get('/swap-list', async (req, res) => {
   }
 });
 
-/* =======================================================================
-   GET /tokens/:id  (returns BOTH: your original stats block **as-is** + rich meta)
-   ======================================================================= */
 router.get('/:id', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
@@ -181,24 +178,68 @@ router.get('/:id', async (req, res) => {
     const priceSource = (req.query.priceSource || 'best').toLowerCase();
     const sel = await resolvePoolSelection(tok.token_id, { priceSource, poolId: req.query.poolId });
 
+    // current native price for selected pool (if any)
     const pr = sel.pool?.pool_id
       ? await DB.query(
-          `SELECT price_in_zig FROM prices WHERE token_id=$1 AND pool_id=$2 ORDER BY updated_at DESC LIMIT 1`,
+          `SELECT price_in_zig 
+             FROM prices 
+            WHERE token_id=$1 AND pool_id=$2 
+         ORDER BY updated_at DESC 
+            LIMIT 1`,
           [tok.token_id, sel.pool.pool_id]
         )
       : { rows: [] };
     const priceNative = pr.rows[0]?.price_in_zig != null ? Number(pr.rows[0].price_in_zig) : null;
 
+    // token static fields
     const srow = await DB.query(`
       SELECT total_supply_base, max_supply_base, exponent, image_uri, website, twitter, telegram, description
-      FROM tokens WHERE token_id=$1
+        FROM tokens WHERE token_id=$1
     `, [tok.token_id]);
     const s = srow.rows[0] || {};
     const exp = s.exponent != null ? Number(s.exponent) : 6;
     const circ = disp(s.total_supply_base, exp);
-    const max  = disp(s.max_supply_base, exp);
+    const max  = disp(s.max_supply_base,   exp);
 
-    // stats aggregates across all pools (4 buckets)
+    // ==== LIVE TVL (sum across this token's UZIG-quoted pools) ===========
+    // TVL_zig(pool) = token_reserve_disp * mid(price_in_zig) + zig_reserve_disp
+    // TVL_usd       = TVL_zig * zigUsd
+    const live = await DB.query(`
+      SELECT
+        p.pool_id,
+        ps.reserve_base_base   AS res_base_base,
+        ps.reserve_quote_base  AS res_quote_base,
+        tb.exponent            AS base_exp,
+        tq.exponent            AS quote_exp,
+        (
+          SELECT price_in_zig
+            FROM prices pr
+           WHERE pr.pool_id = p.pool_id
+             AND pr.token_id = p.base_token_id
+        ORDER BY pr.updated_at DESC
+           LIMIT 1
+        ) AS price_in_zig
+      FROM pools p
+      LEFT JOIN pool_state ps   ON ps.pool_id   = p.pool_id
+      JOIN tokens tb            ON tb.token_id  = p.base_token_id
+      JOIN tokens tq            ON tq.token_id  = p.quote_token_id
+      WHERE p.base_token_id = $1
+        AND p.is_uzig_quote = TRUE
+    `, [tok.token_id]);
+
+    let tvlZigSum = 0;
+    for (const r of live.rows) {
+      const Rt = Number(r.res_base_base  || 0) / Math.pow(10, Number(r.base_exp  ?? 0)); // token reserve (display)
+      const Rz = Number(r.res_quote_base || 0) / Math.pow(10, Number(r.quote_exp ?? 0)); // ZIG reserve (display)
+      const midZig = Number(r.price_in_zig || 0); // zig per token
+      const tvlZigPool = (Rt * midZig) + Rz;
+      if (Number.isFinite(tvlZigPool)) tvlZigSum += tvlZigPool;
+    }
+    const liquidityNativeZig = tvlZigSum;            // ZIG
+    const liquidityUSD       = liquidityNativeZig * zigUsd; // USD
+    // =====================================================================
+
+    // stats aggregates across all pools (four buckets)
     const buckets = ['30m','1h','4h','24h'];
     const agg = await DB.query(`
       SELECT pm.bucket,
@@ -208,11 +249,11 @@ router.get('/:id', async (req, res) => {
              COALESCE(SUM(pm.tx_sell),0)        AS tsell,
              COALESCE(SUM(pm.unique_traders),0) AS uniq,
              COALESCE(SUM(pm.tvl_zig),0)        AS tvl
-      FROM pools p
-      JOIN pool_matrix pm ON pm.pool_id=p.pool_id
-      WHERE p.base_token_id=$1
-        AND pm.bucket = ANY($2)
-      GROUP BY pm.bucket
+        FROM pools p
+        JOIN pool_matrix pm ON pm.pool_id=p.pool_id
+       WHERE p.base_token_id=$1
+         AND pm.bucket = ANY($2)
+       GROUP BY pm.bucket
     `, [tok.token_id, buckets]);
 
     const map = new Map(agg.rows.map(r => [r.bucket, {
@@ -245,18 +286,26 @@ router.get('/:id', async (req, res) => {
     const fdvNative = (priceNative != null && max  != null) ? max  * priceNative : null;
 
     // header meta counts
-    const poolsCount = (await DB.query(`SELECT COUNT(*)::int AS c FROM pools WHERE base_token_id=$1`, [tok.token_id])).rows[0]?.c || 0;
-    const holders    = (await DB.query(`SELECT holders_count FROM token_holders_stats WHERE token_id=$1`, [tok.token_id])).rows[0]?.holders_count || 0;
-    const creation   = (await DB.query(`SELECT MIN(created_at) AS first_ts FROM pools WHERE base_token_id=$1`, [tok.token_id])).rows[0]?.first_ts || null;
+    const poolsCount = (await DB.query(
+      `SELECT COUNT(*)::int AS c FROM pools WHERE base_token_id=$1`, [tok.token_id]
+    )).rows[0]?.c || 0;
+
+    const holders = (await DB.query(
+      `SELECT holders_count FROM token_holders_stats WHERE token_id=$1`, [tok.token_id]
+    )).rows[0]?.holders_count || 0;
+
+    const creation = (await DB.query(
+      `SELECT MIN(created_at) AS first_ts FROM pools WHERE base_token_id=$1`, [tok.token_id]
+    )).rows[0]?.first_ts || null;
 
     // socials (twitter block)
     const tw = await DB.query(`
       SELECT handle, user_id, name, is_blue_verified, verified_type, profile_picture, cover_picture,
              followers, following, created_at_twitter, last_refreshed
-      FROM token_twitter WHERE token_id=$1
+        FROM token_twitter WHERE token_id=$1
     `, [tok.token_id]);
 
-    // === RESPONSE: meta block + your original stats block fields (unchanged names) ===
+    // === RESPONSE =========================================================
     res.json({
       success: true,
       data: {
@@ -285,7 +334,7 @@ router.get('/:id', async (req, res) => {
           }
         } : {},
 
-        // Also expose a compact price sub-object for convenience
+        // Compact price object
         price: {
           source: priceSource,
           poolId: sel.pool?.pool_id ? String(sel.pool.pool_id) : null,
@@ -294,12 +343,12 @@ router.get('/:id', async (req, res) => {
           changePct: priceChange
         },
 
-        // Supply + caps in blocks
+        // Supply + caps
         supply: { circulating: circ, max },
         mcap:   { native: mcNative, usd: mcNative != null ? mcNative * zigUsd : null },
         fdv:    { native: fdvNative, usd: fdvNative != null ? fdvNative * zigUsd : null },
 
-        // ===== Your ORIGINAL block (names/shape preserved) =====
+        // ===== Original block (names preserved) =====
         priceInNative: priceNative,
         priceInUsd: priceNative != null ? priceNative * zigUsd : null,
         priceSource: priceSource,
@@ -307,7 +356,7 @@ router.get('/:id', async (req, res) => {
         pools: poolsCount,
         holder: holders,
         creationTime: creation,
-        supply: max ?? circ,                   // original field
+        supply: max ?? circ, // original field
         circulatingSupply: circ,
         fdvNative,
         fdv: fdvNative != null ? fdvNative * zigUsd : null,
@@ -319,16 +368,18 @@ router.get('/:id', async (req, res) => {
         txBuckets,
         uniqueTraders: r24.uniq,
         trade: r24.tbuy + r24.tsell,
-        sell: r24.tsell,
-        buy:  r24.tbuy,
+        sell:  r24.tsell,
+        buy:   r24.tbuy,
         v: r24.vbuy + r24.vsell,
         vBuy: r24.vbuy,
         vSell: r24.vsell,
         vUSD: (r24.vbuy + r24.vsell) * zigUsd,
         vBuyUSD: r24.vbuy * zigUsd,
         vSellUSD: r24.vsell * zigUsd,
-        tradeCount: { buy: r24.tbuy, sell: r24.tsell, total: r24.tbuy + r24.tsell },
-        liquidity: r24.tvl
+
+        // >>> fixed liquidity <<<
+        liquidity: liquidityUSD,                 // USD
+        liquidityNative: liquidityNativeZig      // ZIG (extra, non-breaking)
       }
     });
   } catch (e) {
