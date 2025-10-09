@@ -5,69 +5,56 @@ import { resolveTokenId, getZigUsd } from '../util/resolve-token.js';
 
 const router = express.Router();
 
-/* ----------------------------- helpers ---------------------------------- */
+/* ───────────────────────── helpers ───────────────────────── */
 
-const UZIG_KEYWORDS = new Set(['uzig', 'zig', 'uZIG', 'UZIG']);
-const isUzigRef = (s) => !!s && UZIG_KEYWORDS.has(String(s).trim().toLowerCase());
+const UZIG_ALIASES = new Set(['uzig','zig','uZIG','UZIG']);
+const isUzigRef = (s) => !!s && UZIG_ALIASES.has(String(s).trim().toLowerCase());
 
 async function resolveRef(ref) {
   if (isUzigRef(ref)) return { type: 'uzig' };
-  const tok = await resolveTokenId(ref);
+  const tok = await resolveTokenId(ref); // must return { token_id, denom, symbol, exponent, ... }
   if (!tok) return null;
   return { type: 'token', token: tok };
 }
 
-/** Parse Oroswap pair type → taker fee fraction. Supports both "custom(xyk_25)" and "custom-xyk_25". */
+/** Oroswap pair type → taker fee fraction */
 function pairFee(pairType) {
-  if (!pairType) return 0.003; // ultra safe default
-
+  if (!pairType) return 0.003;
   const t = String(pairType).toLowerCase();
-
-  if (t === 'xyk') return 0.0001;                 // 1 bps = 0.01%
-  if (t === 'concentrated') return 0.01;          // 100 bps = 1%
-
-  // custom formats:
-  // "custom(xyk_25)" or "custom-xyk_25"
+  if (t === 'xyk') return 0.0001;
+  if (t === 'concentrated') return 0.01;
   const m = t.match(/xyk[_-](\d+)/);
   if (m) {
     const bps = Number(m[1]);
-    if (Number.isFinite(bps)) return bps / 10_000; // bps → fraction
+    if (Number.isFinite(bps)) return bps / 10_000;
   }
-
   return 0.003;
 }
 
-/** XYK simulation with fee-on-input. */
+/** XYK simulation (fee-on-input). Rz = zig reserve, Rt = token reserve. */
 function simulateXYK({ fromIsZig, amountIn, Rz, Rt, fee }) {
   if (!(Rz > 0 && Rt > 0) || !(amountIn > 0)) {
     return { out: 0, price: 0, impact: 0 };
   }
-  const mid = Rz / Rt; // zig per token (quote/base)
-  const xInAfterFee = amountIn * (1 - fee);
+  const mid = Rz / Rt; // zig per token
+  const xin = amountIn * (1 - fee);
 
   if (fromIsZig) {
     // ZIG -> Token
-    const outToken = (xInAfterFee * Rt) / (Rz + xInAfterFee);
-    const effPriceZigPerToken = amountIn / Math.max(outToken, 1e-18);
-    const impact = mid > 0 ? (effPriceZigPerToken / mid) - 1 : 0;
-    return { out: outToken, price: effPriceZigPerToken, impact };
+    const outToken = (xin * Rt) / (Rz + xin);
+    const effZigPerToken = amountIn / Math.max(outToken, 1e-18);
+    const impact = mid > 0 ? (effZigPerToken / mid) - 1 : 0;
+    return { out: outToken, price: effZigPerToken, impact };
   } else {
     // Token -> ZIG
-    const outZig = (xInAfterFee * Rz) / (Rt + xInAfterFee);
-    const effPriceZigPerToken = outZig / amountIn; // zig per token actually received
-    const impact = mid > 0 ? (mid / Math.max(effPriceZigPerToken, 1e-18)) - 1 : 0;
-    return { out: outZig, price: effPriceZigPerToken, impact };
+    const outZig = (xin * Rz) / (Rt + xin);
+    const effZigPerToken = outZig / amountIn; // executable zig per 1 token
+    const impact = mid > 0 ? (mid / Math.max(effZigPerToken, 1e-18)) - 1 : 0;
+    return { out: outZig, price: effZigPerToken, impact };
   }
 }
 
-/**
- * Load UZIG-quoted pools for a token with:
- *  - price_in_zig (mid)
- *  - reserves from pool_state converted to display units using tokens.exponent
- *  - tvl_zig from pool_matrix (24h)
- *
- * Assumption: is_uzig_quote=TRUE ⇒ quote is ZIG, base is the token.
- */
+/** Load all UZIG-quoted pools for a token, including mid price & reserves (display units). */
 async function loadUzigPoolsForToken(tokenId, { minTvlZig = 0 } = {}) {
   const { rows } = await DB.query(
     `
@@ -75,17 +62,19 @@ async function loadUzigPoolsForToken(tokenId, { minTvlZig = 0 } = {}) {
       p.pool_id,
       p.pair_contract,
       p.pair_type,
-      pr.price_in_zig,
+      pr.price_in_zig,           -- mid zig per token
       ps.reserve_base_base   AS res_base_base,
       ps.reserve_quote_base  AS res_quote_base,
       tb.exponent            AS base_exp,
       tq.exponent            AS quote_exp,
-      COALESCE(pm.tvl_zig, 0) AS tvl_zig
+      COALESCE(pm.tvl_zig,0) AS tvl_zig,
+      tb.denom               AS base_denom,
+      tq.denom               AS quote_denom
     FROM pools p
-    JOIN prices pr        ON pr.pool_id = p.pool_id AND pr.token_id = $1
-    LEFT JOIN pool_state ps ON ps.pool_id = p.pool_id
-    JOIN tokens tb        ON tb.token_id = p.base_token_id    -- the token itself
-    JOIN tokens tq        ON tq.token_id = p.quote_token_id   -- ZIG
+    JOIN prices pr           ON pr.pool_id = p.pool_id AND pr.token_id = $1
+    LEFT JOIN pool_state ps  ON ps.pool_id = p.pool_id
+    JOIN tokens tb           ON tb.token_id = p.base_token_id
+    JOIN tokens tq           ON tq.token_id = p.quote_token_id
     LEFT JOIN pool_matrix pm ON pm.pool_id = p.pool_id AND pm.bucket = '24h'
     WHERE p.is_uzig_quote = TRUE
     `,
@@ -94,271 +83,208 @@ async function loadUzigPoolsForToken(tokenId, { minTvlZig = 0 } = {}) {
 
   return rows
     .map(r => {
-      const baseExp  = Number(r.base_exp || 0);
-      const quoteExp = Number(r.quote_exp || 0);
-
-      // Convert reserves from base units → display units
-      const Rt = Number(r.res_base_base  || 0) / Math.pow(10, baseExp);   // token reserve
-      const Rz = Number(r.res_quote_base || 0) / Math.pow(10, quoteExp);  // zig reserve
-
+      const Rt = Number(r.res_base_base  || 0) / Math.pow(10, Number(r.base_exp  || 0)); // token reserve
+      const Rz = Number(r.res_quote_base || 0) / Math.pow(10, Number(r.quote_exp || 0)); // zig reserve
       return {
-        poolId:        String(r.pool_id),
-        pairContract:  r.pair_contract,
-        pairType:      r.pair_type,
-        priceInZig:    Number(r.price_in_zig), // mid zig per token
-        tokenReserve:  Rt,
-        zigReserve:    Rz,
-        tvlZig:        Number(r.tvl_zig || 0),
+        poolId:       String(r.pool_id),
+        pairContract: r.pair_contract,
+        pairType:     r.pair_type,
+        priceInZig:   Number(r.price_in_zig || 0), // **mid** zig per token
+        tokenReserve: Rt,
+        zigReserve:   Rz,
+        tvlZig:       Number(r.tvl_zig || 0),
       };
     })
     .filter(p => p.tvlZig >= minTvlZig);
 }
 
-/** Mid + TVL tie-break fallback when simulation not possible. */
-function rankByMidWithTvl(pools, side /* 'buy' | 'sell' */, { tiePct = 0.004 } = {}) {
-  const cmpMid = (a, b) => (side === 'buy' ? a.priceInZig - b.priceInZig : b.priceInZig - a.priceInZig);
-
-  const sorted = [...pools].sort((a, b) => {
-    const o = cmpMid(a, b);
-    if (o !== 0) {
-      const best = (side === 'buy' ? a : b);
-      const worse = (side === 'buy' ? b : a);
-      const diff = Math.abs(best.priceInZig - worse.priceInZig);
-      const rel  = diff / Math.max(best.priceInZig, worse.priceInZig, 1e-18);
-      if (rel <= tiePct) {
-        return (b.tvlZig || 0) - (a.tvlZig || 0);
-      }
-      return o;
-    }
-    return (b.tvlZig || 0) - (a.tvlZig || 0);
-  });
-
-  return sorted[0] || null;
-}
-
-/** Pick the pool that maximizes executable output for a given notional. */
-function pickBySimulation(pools, side /* 'buy' | 'sell' */, { fromIsZig, amountIn }) {
+/** Pick best pool by sim (maximize out). */
+function pickBySimulation(pools, side, { fromIsZig, amountIn }) {
   let best = null;
-
   for (const p of pools) {
     const fee = pairFee(p.pairType);
     const hasRes = p.zigReserve > 0 && p.tokenReserve > 0;
-
     const sim = hasRes
-      ? simulateXYK({
-          fromIsZig,
-          amountIn,
-          Rz: p.zigReserve,
-          Rt: p.tokenReserve,
-          fee
-        })
+      ? simulateXYK({ fromIsZig, amountIn, Rz: p.zigReserve, Rt: p.tokenReserve, fee })
       : null;
-
-    // Score equals output tokens (maximize out)
-    const score = sim
-      ? sim.out
-      : (side === 'buy'
-          ? (1 / Math.max(p.priceInZig, 1e-18)) * Math.log10(1 + (p.tvlZig || 1))
-          : p.priceInZig * Math.log10(1 + (p.tvlZig || 1))
-        );
-
+    const score = sim ? sim.out : 0;
     const cand = { ...p, fee, sim, score };
     if (!best || cand.score > best.score) best = cand;
   }
   return best;
 }
 
-/** choose default amounts (~$100 notional) if no 'amt' was provided */
-function defaultAmounts({ side, zigUsd, pools }) {
+/** Default notional (~$100) when amt not provided. */
+function defaultAmount(side, { zigUsd, pools }) {
   const targetUsd = 100;
   const zigAmt = targetUsd / Math.max(zigUsd, 1e-9);
-
-  if (side === 'buy') {
-    // From = ZIG
-    return { amount: zigAmt, note: 'defaulted_to_~$100_in_ZIG' };
-  }
-  // side === 'sell': From = TOKEN. Estimate using average mid.
+  if (side === 'buy') return zigAmt; // from ZIG
   const avgMid = pools.length
     ? pools.reduce((s, p) => s + (p.priceInZig || 0), 0) / pools.length
     : 1;
-  const tokenAmt = zigAmt / Math.max(avgMid, 1e-12);
-  return { amount: tokenAmt, note: 'defaulted_to_~$100_in_token' };
+  return zigAmt / Math.max(avgMid, 1e-12); // from token
 }
 
-/* --------------------------- pool picking -------------------------------- */
+/** Render diagnostics block for one leg. Includes both EXEC (sim) and MID (DB) prices. */
+function makePairBlock({ side, pool, sim, fee, zigUsd, amountIn }) {
+  const price_native_exec = sim ? sim.price : null; // executable zig per 1 token (for that amount)
+  const price_usd_exec    = price_native_exec != null ? price_native_exec * zigUsd : null;
 
-async function bestBuyPool(tokenId, { amountIn, minTvlZig, tiePct, zigUsd }) {
-  const pools = await loadUzigPoolsForToken(tokenId, { minTvlZig });
-  if (!pools.length) return null;
-
-  const amt = Number.isFinite(amountIn)
-    ? Number(amountIn)
-    : defaultAmounts({ side: 'buy', zigUsd, pools }).amount;
-
-  const bySim = pickBySimulation(pools, 'buy', { fromIsZig: true, amountIn: amt });
-  if (!bySim) return null;
-
-  if (!bySim.sim) {
-    const fallback = rankByMidWithTvl(pools, 'buy', { tiePct });
-    if (!fallback) return null;
-    return {
-      ...fallback,
-      priceInZig: fallback.priceInZig,
-      diagnostics: { mode: 'fallback_mid_tvl' }
-    };
-  }
+  const price_native_mid  = pool.priceInZig;        // mid zig per 1 token (DB)
+  const price_usd_mid     = price_native_mid * zigUsd;
 
   return {
-    ...bySim,
-    priceInZig: bySim.sim.price, // executable zig per token for amt
-    diagnostics: {
-      mode: 'simulated',
-      amountIn: amt,
-      fromIsZig: true,
-      reserves: { zig: bySim.zigReserve, token: bySim.tokenReserve },
-      out: bySim.sim.out,
-      impact: bySim.sim.impact,
-      fee: bySim.fee
-    }
+    poolId: pool.poolId,
+    pairContract: pool.pairContract,
+    pairType: pool.pairType,
+    side,
+    // EXEC (diagnostic)
+    price_native_exec,
+    price_usd_exec,
+    // MID (stable unit valuation)
+    price_native_mid,
+    price_usd_mid,
+    // sim payload
+    amount_in: amountIn ?? null,
+    amount_out: sim ? sim.out : null,
+    price_impact: sim ? sim.impact : null,
+    fee
   };
 }
 
-async function bestSellPool(tokenId, { amountIn, minTvlZig, tiePct, zigUsd }) {
+/* ─────────────────────── per-side selectors ─────────────────────── */
+
+async function bestBuyPool(tokenId, { amountIn, minTvlZig, zigUsd }) {
   const pools = await loadUzigPoolsForToken(tokenId, { minTvlZig });
   if (!pools.length) return null;
-
-  const amt = Number.isFinite(amountIn)
-    ? Number(amountIn)
-    : defaultAmounts({ side: 'sell', zigUsd, pools }).amount;
-
-  const bySim = pickBySimulation(pools, 'sell', { fromIsZig: false, amountIn: amt });
-  if (!bySim) return null;
-
-  if (!bySim.sim) {
-    const fallback = rankByMidWithTvl(pools, 'sell', { tiePct });
-    if (!fallback) return null;
-    return {
-      ...fallback,
-      priceInZig: fallback.priceInZig,
-      diagnostics: { mode: 'fallback_mid_tvl' }
-    };
-  }
-
-  return {
-    ...bySim,
-    priceInZig: bySim.sim.price, // executable zig per token for amt
-    diagnostics: {
-      mode: 'simulated',
-      amountIn: amt,
-      fromIsZig: false,
-      reserves: { zig: bySim.zigReserve, token: bySim.tokenReserve },
-      out: bySim.sim.out,
-      impact: bySim.sim.impact,
-      fee: bySim.fee
-    }
-  };
+  const amt = Number.isFinite(amountIn) ? Number(amountIn) : defaultAmount('buy', { zigUsd, pools });
+  const pick = pickBySimulation(pools, 'buy', { fromIsZig: true, amountIn: amt });
+  if (!pick) return null;
+  return { ...pick, amtUsed: amt };
 }
 
-/* ------------------------------- route ----------------------------------- */
-/**
- * GET /swap?from=<ref>&to=<ref>&amt=<number>&minTvl=<zig>&tiePct=<fraction>
- *
- * - UZIG -> Token : BUY (simulate ZIG→Token, pick max token out)
- * - Token -> UZIG : SELL (simulate Token→ZIG, pick max ZIG out)
- * - TokenA -> TokenB : via UZIG; chain the simulations
- */
+async function bestSellPool(tokenId, { amountIn, minTvlZig, zigUsd }) {
+  const pools = await loadUzigPoolsForToken(tokenId, { minTvlZig });
+  if (!pools.length) return null;
+  const amt = Number.isFinite(amountIn) ? Number(amountIn) : defaultAmount('sell', { zigUsd, pools });
+  const pick = pickBySimulation(pools, 'sell', { fromIsZig: false, amountIn: amt });
+  if (!pick) return null;
+  return { ...pick, amtUsed: amt };
+}
+
+/* ─────────────────────────── route API ─────────────────────────── */
+
 router.get('/', async (req, res) => {
   try {
     const fromRef = req.query.from;
     const toRef   = req.query.to;
     if (!fromRef || !toRef) return res.status(400).json({ success:false, error:'missing from/to' });
 
-    const zigUsd     = await getZigUsd();
-    const amt        = req.query.amt ? Number(req.query.amt) : undefined;
-    const minTvlZig  = req.query.minTvl ? Number(req.query.minTvl) : 0;
-    const tiePct     = req.query.tiePct ? Number(req.query.tiePct) : 0.004;
+    const zigUsd    = await getZigUsd();           // from exchange_rates
+    const amt       = req.query.amt ? Number(req.query.amt) : undefined;
+    const minTvlZig = req.query.minTvl ? Number(req.query.minTvl) : 0;
 
     const from = await resolveRef(fromRef);
     const to   = await resolveRef(toRef);
     if (!from) return res.status(404).json({ success:false, error:'from token not found' });
     if (!to)   return res.status(404).json({ success:false, error:'to token not found' });
 
-    // UZIG -> Token (BUY)
+    /* ── ZIG → TOKEN (BUY) ─────────────────────────────────────── */
     if (from.type === 'uzig' && to.type === 'token') {
-      const best = await bestBuyPool(to.token.token_id, { amountIn: amt, minTvlZig, tiePct, zigUsd });
-      if (!best) {
+      const buy = await bestBuyPool(to.token.token_id, { amountIn: amt, minTvlZig, zigUsd });
+      if (!buy) {
         return res.json({ success:true, data:{
-          route:['uzig', to.token.denom || to.token.symbol], pairs:[], price_native:null, price_usd:null, source:'direct_uzig'
+          route:['uzig', to.token.denom || to.token.symbol], pairs:[],
+          price_native:null, price_usd:null, cross:{ zig_per_from:1, usd_per_from:zigUsd },
+          usd_baseline:{ from_usd: zigUsd, to_usd: null }, source:'direct_uzig'
         }});
       }
-      const priceNative = best.priceInZig;
-      const priceUsd = priceNative * zigUsd;
+
+      const pairBlock = makePairBlock({
+        side:'buy', pool: buy, sim: buy.sim, fee: buy.fee, zigUsd, amountIn: buy.amtUsed
+      });
+
+      // top snapshot (executable per-unit for that amount)
+      const price_native = pairBlock.price_native_exec;
+      const price_usd    = pairBlock.price_usd_exec;
+
+      // baselines for $ labels in UI
+      const from_usd = zigUsd;
+      const to_usd   = pairBlock.price_native_mid * zigUsd; // mid( token )
 
       return res.json({
         success: true,
         data: {
           route: ['uzig', to.token.denom || to.token.symbol || String(to.token.token_id)],
-          pairs: [{ poolId: best.poolId, pairContract: best.pairContract, pairType: best.pairType }],
-          price_native: priceNative,
-          price_usd: priceUsd,
+          pairs: [ pairBlock ],
+          price_native,                      // exec zig per 1 token (diagnostic)
+          price_usd,                         // exec USD per 1 token (diagnostic)
+          cross: { zig_per_from: 1, usd_per_from: zigUsd },
+          usd_baseline: { from_usd, to_usd },// **UI should use these for $**
           source: 'direct_uzig',
           diagnostics: {
             side: 'buy',
-            selection: best.diagnostics?.mode || 'simulated',
-            poolId: best.poolId,
-            pairType: best.pairType,
-            tvl_zig: best.tvlZig,
-            reserves: { zig: best.zigReserve, token: best.tokenReserve },
-            sim: best.sim || null,
-            params: { amt: amt ?? null, minTvlZig, tiePct }
+            poolId: buy.poolId,
+            pairType: buy.pairType,
+            tvl_zig: buy.tvlZig,
+            reserves: { zig: buy.zigReserve, token: buy.tokenReserve },
+            sim: buy.sim || null,
+            params: { amt: amt ?? null, minTvlZig }
           }
         }
       });
     }
 
-    // Token -> UZIG (SELL)
+    /* ── TOKEN → ZIG (SELL) ────────────────────────────────────── */
     if (from.type === 'token' && to.type === 'uzig') {
-      const best = await bestSellPool(from.token.token_id, { amountIn: amt, minTvlZig, tiePct, zigUsd });
-      if (!best) {
+      const sell = await bestSellPool(from.token.token_id, { amountIn: amt, minTvlZig, zigUsd });
+      if (!sell) {
         return res.json({ success:true, data:{
-          route:[from.token.denom || from.token.symbol, 'uzig'], pairs:[], price_native:null, price_usd:null, source:'direct_uzig'
+          route:[from.token.denom || from.token.symbol, 'uzig'], pairs:[],
+          price_native:null, price_usd:null,
+          cross:{ zig_per_from:null, usd_per_from:null },
+          usd_baseline:{ from_usd: null, to_usd: zigUsd }, source:'direct_uzig'
         }});
       }
-      const priceNative = best.priceInZig;
-      const priceUsd = priceNative * zigUsd;
+
+      const pairBlock = makePairBlock({
+        side:'sell', pool: sell, sim: sell.sim, fee: sell.fee, zigUsd, amountIn: sell.amtUsed
+      });
+
+      const price_native = pairBlock.price_native_exec; // exec zig per 1 token
+      const price_usd    = price_native != null ? price_native * zigUsd : null;
+
+      const from_usd = sell.priceInZig * zigUsd; // mid( token )
+      const to_usd   = zigUsd;
 
       return res.json({
         success: true,
         data: {
           route: [from.token.denom || from.token.symbol || String(from.token.token_id), 'uzig'],
-          pairs: [{ poolId: best.poolId, pairContract: best.pairContract, pairType: best.pairType }],
-          price_native: priceNative,
-          price_usd: priceUsd,
+          pairs: [ pairBlock ],
+          price_native,
+          price_usd,
+          cross: { zig_per_from: price_native, usd_per_from: from_usd },
+          usd_baseline: { from_usd, to_usd },  // **UI should use these for $**
           source: 'direct_uzig',
           diagnostics: {
             side: 'sell',
-            selection: best.diagnostics?.mode || 'simulated',
-            poolId: best.poolId,
-            pairType: best.pairType,
-            tvl_zig: best.tvlZig,
-            reserves: { zig: best.zigReserve, token: best.tokenReserve },
-            sim: best.sim || null,
-            params: { amt: amt ?? null, minTvlZig, tiePct }
+            poolId: sell.poolId,
+            pairType: sell.pairType,
+            tvl_zig: sell.tvlZig,
+            reserves: { zig: sell.zigReserve, token: sell.tokenReserve },
+            sim: sell.sim || null,
+            params: { amt: amt ?? null, minTvlZig }
           }
         }
       });
     }
 
-    // TokenA -> TokenB (via UZIG)
+    /* ── TOKEN A → TOKEN B (via UZIG) ──────────────────────────── */
     if (from.type === 'token' && to.type === 'token') {
-      // Leg 1: A -> UZIG
-      const sellA = await bestSellPool(from.token.token_id, { amountIn: amt, minTvlZig, tiePct, zigUsd });
-
-      let zigOut = null;
-      if (sellA?.sim) zigOut = sellA.sim.out;
-
-      // Leg 2: UZIG -> B (use zigOut as input if we have it)
-      const buyB = await bestBuyPool(to.token.token_id, { amountIn: zigOut || undefined, minTvlZig, tiePct, zigUsd });
+      const sellA = await bestSellPool(from.token.token_id, { amountIn: amt, minTvlZig, zigUsd });
+      const zigOut = sellA?.sim ? sellA.sim.out : undefined;
+      const buyB  = await bestBuyPool(to.token.token_id,   { amountIn: zigOut, minTvlZig, zigUsd });
 
       if (!sellA || !buyB) {
         return res.json({
@@ -372,16 +298,27 @@ router.get('/', async (req, res) => {
             pairs: [],
             price_native: null,
             price_usd: null,
+            cross: { zig_per_from: null, usd_per_from: null },
+            usd_baseline: { from_usd: null, to_usd: null },
             source: 'via_uzig',
             diagnostics: { sellA: !!sellA, buyB: !!buyB }
           }
         });
       }
 
-      // Cross-rate (B per 1 A)
+      const sellBlock = makePairBlock({
+        side:'sell', pool: sellA, sim: sellA.sim, fee: sellA.fee, zigUsd, amountIn: sellA.amtUsed
+      });
+      const buyBlock  = makePairBlock({
+        side:'buy',  pool: buyB,  sim: buyB.sim,  fee: buyB.fee,  zigUsd, amountIn: buyB.amtUsed
+      });
+
+      // Executable cross-rate (B per 1 A): (zig/A) / (zig/B)
       const bPerA = sellA.priceInZig / Math.max(buyB.priceInZig, 1e-18);
-      const zigPerA = sellA.priceInZig;
-      const usdPerA = zigPerA * zigUsd;
+
+      // Baselines for $ labels
+      const from_usd = sellA.priceInZig * zigUsd; // mid(A)
+      const to_usd   = buyB.priceInZig  * zigUsd; // mid(B)
 
       return res.json({
         success: true,
@@ -391,13 +328,11 @@ router.get('/', async (req, res) => {
             'uzig',
             to.token.denom || to.token.symbol || String(to.token.token_id)
           ],
-          pairs: [
-            { poolId: sellA.poolId, pairContract: sellA.pairContract, pairType: sellA.pairType },
-            { poolId: buyB.poolId,  pairContract: buyB.pairContract,  pairType: buyB.pairType  }
-          ],
-          price_native: bPerA,
-          cross: { zig_per_from: zigPerA, usd_per_from: usdPerA },
+          pairs: [ sellBlock, buyBlock ],          // exec + mid per leg (diagnostic)
+          price_native: bPerA,                     // B per A (exec snapshot)
           price_usd: null,
+          cross: { zig_per_from: sellA.priceInZig, usd_per_from: from_usd }, // exec sell-side rate
+          usd_baseline: { from_usd, to_usd },      // **UI should use these for $**
           source: 'via_uzig',
           diagnostics: {
             sell_leg: {
