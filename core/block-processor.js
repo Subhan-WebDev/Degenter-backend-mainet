@@ -302,10 +302,6 @@ export async function processHeight(h) {
           height: h, tx_hash, signer: signerEOA, msg_index: msgIndex, created_at: timestamp
         });
 
-        await upsertPoolState(
-          pool.pool_id, pool.base_denom, pool.quote_denom, res1d, res1a, res2d, res2a
-        );
-
         // live price (no OHLCV on liq)
         if (pool.is_uzig_quote) {
           try {
