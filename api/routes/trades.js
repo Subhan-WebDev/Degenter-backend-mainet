@@ -8,6 +8,8 @@ const router = express.Router();
 /* ---------------- helpers ---------------- */
 
 const VALID_DIR = new Set(['buy','sell','provide','withdraw']);
+const VALID_CLASS = new Set(['shrimp','shark','whale']);
+const VALID_LIMITS = new Set([100, 500, 1000]);
 
 function normDir(d) {
   const x = String(d || '').toLowerCase();
@@ -20,18 +22,52 @@ function clampInt(v, { min = 0, max = 1e9, def = 0 } = {}) {
   return Math.max(min, Math.min(max, n));
 }
 
-function classify(v, unit) {
-  if (v == null) return null;
-  const x = Number(v);
-  if (unit === 'zig') {
-    if (x < 1_000) return 'shrimp';
-    if (x <= 10_000) return 'shark';
-    return 'whale';
-  } else {
-    if (x < 1_000) return 'shrimp';
-    if (x <= 10_000) return 'shark';
-    return 'whale';
-  }
+function parseLimit(q) {
+  const n = Number(q);
+  if (VALID_LIMITS.has(n)) return n;
+  return 100; // default
+}
+function parsePage(q) {
+  const n = Number(q);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+}
+
+/** Fetch enough rows to cover (page * limit) before post-filters/combining */
+function computeSqlFetchLimit(page, limit, hardMax = 5000) {
+  const OVERSAMPLE = 5;                 // try 5–10 if needed
+  return Math.min(page * limit * OVERSAMPLE, hardMax);
+}
+
+function classifyByWorth(value /* number|null */) {
+  if (value == null) return null;
+  const x = Number(value);
+  if (x < 1000) return 'shrimp';
+  if (x <= 10000) return 'shark';
+  return 'whale';
+}
+
+function applyClassFilter(data, unit, klass) {
+  if (!klass) return data;
+  if (!VALID_CLASS.has(klass)) return data;
+  return data.filter(x => {
+    const worth = unit === 'usd' ? x.valueUsd : x.valueNative;
+    return classifyByWorth(worth) === klass;
+  });
+}
+
+function paginate(data, page, limit) {
+  const total = data.length;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const p = Math.min(page, pages);
+  const start = (p - 1) * limit;
+  const end = start + limit;
+  return {
+    items: data.slice(start, end),
+    total,
+    page: p,
+    pages,
+    limit
+  };
 }
 
 // scale base amount using exponent; uzig => 6 by default
@@ -89,7 +125,7 @@ function buildTradesQuery({
   includeLiquidity, // boolean
   direction,        // 'buy' | 'sell' | 'provide' | 'withdraw' | null
   windowOpts,       // {tf, from, to, days}
-  limit, offset
+  sqlLimit, sqlOffset = 0
 }) {
   const params = [];
   const where = [];
@@ -126,42 +162,37 @@ function buildTradesQuery({
   where.push(clause);
 
   const sql = `
-    WITH base AS (
-      SELECT
-        t.*,
-        p.pair_contract,
-        p.is_uzig_quote,
+    SELECT
+      t.*,
+      p.pair_contract,
+      p.is_uzig_quote,
 
-        -- quote token (right side of pair)
-        q.exponent AS qexp,
+      -- quote token (right side of pair)
+      q.exponent AS qexp,
 
-        -- base token (left side of pair) — used to compute price per BASE
-        b.exponent AS bexp,
-        b.denom    AS base_denom,
+      -- base token (left side of pair) — used to compute price per BASE
+      b.exponent AS bexp,
+      b.denom    AS base_denom,
 
-        -- latest price of QUOTE token in ZIG (when quote != uzig)
-        (SELECT price_in_zig
-           FROM prices
-          WHERE token_id = p.quote_token_id
-          ORDER BY updated_at DESC
-          LIMIT 1) AS pq_price_in_zig,
+      -- latest price of QUOTE token in ZIG (when quote != uzig)
+      (SELECT price_in_zig
+         FROM prices
+        WHERE token_id = p.quote_token_id
+        ORDER BY updated_at DESC
+        LIMIT 1) AS pq_price_in_zig,
 
-        -- exponents of the trade legs
-        toff.exponent AS offer_exp,
-        task.exponent AS ask_exp,
-
-        COUNT(*) OVER() AS total
-      FROM trades t
-      JOIN pools  p ON p.pool_id = t.pool_id
-      JOIN tokens q ON q.token_id = p.quote_token_id
-      JOIN tokens b ON b.token_id = p.base_token_id
-      LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
-      LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
-      WHERE ${where.join(' AND ')}
-      ORDER BY t.created_at DESC
-      LIMIT ${limit} OFFSET ${offset}
-    )
-    SELECT * FROM base
+      -- exponents of the trade legs
+      toff.exponent AS offer_exp,
+      task.exponent AS ask_exp
+    FROM trades t
+    JOIN pools  p ON p.pool_id = t.pool_id
+    JOIN tokens q ON q.token_id = p.quote_token_id
+    JOIN tokens b ON b.token_id = p.base_token_id
+    LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
+    LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
+    WHERE ${where.join(' AND ')}
+    ORDER BY t.created_at DESC
+    LIMIT ${sqlLimit} OFFSET ${sqlOffset}
   `;
 
   return { sql, params };
@@ -249,7 +280,7 @@ function shapeRow(r, unit, zigUsd) {
     : null;
   const priceUsd = priceNative != null ? priceNative * zigUsd : null;
 
-  const klass = classify(unit === 'usd' ? valueUsd : valueZig, unit);
+  const cls = classifyByWorth((unit === 'usd') ? valueUsd : valueZig);
 
   return {
     time: r.created_at,
@@ -257,6 +288,8 @@ function shapeRow(r, unit, zigUsd) {
     pairContract: r.pair_contract,
     signer: r.signer,
     direction: r.direction,
+
+    is_router: r.is_router === true, // passthrough
 
     offerDenom: r.offer_asset_denom,
     offerAmountBase: r.offer_amount_base,
@@ -278,46 +311,80 @@ function shapeRow(r, unit, zigUsd) {
     valueNative: valueZig,
     valueUsd,
 
-    class: klass
+    class: cls
   };
+}
+
+/** Combine router legs by txHash, summing worth */
+function combineRouterTrades(items, unit /* 'usd'|'zig' */) {
+  const byTx = new Map();
+  for (const t of items) {
+    const key = t.txHash;
+    const cur = byTx.get(key);
+    if (!cur) {
+      byTx.set(key, { ...t, legs: [t] });
+    } else {
+      cur.legs.push(t);
+      // accumulate worth
+      cur.valueNative = (cur.valueNative ?? 0) + (t.valueNative ?? 0);
+      cur.valueUsd    = (cur.valueUsd ?? 0) + (t.valueUsd ?? 0);
+      // earliest time
+      cur.time = cur.time < t.time ? cur.time : t.time;
+      // mark router
+      cur.is_router = cur.is_router || t.is_router;
+    }
+  }
+  return Array.from(byTx.values()).map(x => {
+    if (!x.is_router) return x; // not a router aggregate — leave as-is
+    const first = x.legs[0];
+    return {
+      ...x,
+      pairContract: 'router',
+      direction: first.direction,
+      class: classifyByWorth(unit === 'usd' ? x.valueUsd : x.valueNative)
+    };
+  });
 }
 
 /* ---------------- routes ---------------- */
 
 /** GET /trades
- *  tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
- *  unit=usd|zig
- *  class=shrimp|shark|whale
- *  direction=buy|sell|provide|withdraw
- *  includeLiquidity=1
- *  limit, offset
+ *  New pagination: page=1..N (default 1), limit=100|500|1000 (default 100)
+ *  Optional: class=shrimp|shark|whale, combineRouter=1
+ *  Window: tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
+ *  unit=usd|zig, direction=buy|sell|provide|withdraw, includeLiquidity=1
  */
 router.get('/', async (req, res) => {
   try {
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:500 });
-    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
+    const page   = parsePage(req.query.page);
+    const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
+    const combine = req.query.combineRouter === '1';
 
     const zigUsd = await getZigUsd();
+
+    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
 
     const { sql, params } = buildTradesQuery({
       scope: 'all',
       includeLiquidity,
       direction: dir,
       windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      limit, offset
+      sqlLimit, sqlOffset: 0
     });
 
     const { rows } = await DB.query(sql, params);
     let data = rows.map(r => shapeRow(r, unit, zigUsd));
 
-    const klass = String(req.query.class || '').toLowerCase();
-    if (klass) data = data.filter(x => x.class === klass);
+    if (combine) data = combineRouterTrades(data, unit);
 
-    const total = rows[0]?.total ? Number(rows[0].total) : data.length;
-    res.json({ success:true, data, meta:{ unit, tf:req.query.tf||'24h', limit, offset, total } });
+    const klass = String(req.query.class || '').toLowerCase();
+    if (klass) data = applyClassFilter(data, unit, klass);
+
+    const { items, total, pages, page: p } = paginate(data, page, limit);
+    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
@@ -330,12 +397,15 @@ router.get('/token/:id', async (req, res) => {
     if (!tok) return res.status(404).json({ success:false, error:'token not found' });
 
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:500 });
-    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
+    const page   = parsePage(req.query.page);
+    const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
+    const combine = req.query.combineRouter === '1';
 
     const zigUsd = await getZigUsd();
+
+    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
 
     const { sql, params } = buildTradesQuery({
       scope: 'token',
@@ -343,17 +413,19 @@ router.get('/token/:id', async (req, res) => {
       includeLiquidity,
       direction: dir,
       windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      limit, offset
+      sqlLimit, sqlOffset: 0
     });
 
     const { rows } = await DB.query(sql, params);
     let data = rows.map(r => shapeRow(r, unit, zigUsd));
 
-    const klass = String(req.query.class || '').toLowerCase();
-    if (klass) data = data.filter(x => x.class === klass);
+    if (combine) data = combineRouterTrades(data, unit);
 
-    const total = rows[0]?.total ? Number(rows[0].total) : data.length;
-    res.json({ success:true, data, meta:{ unit, tf:req.query.tf||'24h', limit, offset, total } });
+    const klass = String(req.query.class || '').toLowerCase();
+    if (klass) data = applyClassFilter(data, unit, klass);
+
+    const { items, total, pages, page: p } = paginate(data, page, limit);
+    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
@@ -371,12 +443,15 @@ router.get('/pool/:ref', async (req, res) => {
     const poolId = row.rows[0].pool_id;
 
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = clampInt(req.query.limit,  { min:1, max:5000, def:500 });
-    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
+    const page   = parsePage(req.query.page);
+    const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
+    const combine = req.query.combineRouter === '1';
 
     const zigUsd = await getZigUsd();
+
+    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
 
     const { sql, params } = buildTradesQuery({
       scope: 'pool',
@@ -384,38 +459,36 @@ router.get('/pool/:ref', async (req, res) => {
       includeLiquidity,
       direction: dir,
       windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      limit, offset
+      sqlLimit, sqlOffset: 0
     });
 
     const { rows } = await DB.query(sql, params);
     let data = rows.map(r => shapeRow(r, unit, zigUsd));
 
-    const klass = String(req.query.class || '').toLowerCase();
-    if (klass) data = data.filter(x => x.class === klass);
+    if (combine) data = combineRouterTrades(data, unit);
 
-    const total = rows[0]?.total ? Number(rows[0].total) : data.length;
-    res.json({ success:true, data, meta:{ unit, tf:req.query.tf||'24h', limit, offset, total } });
+    const klass = String(req.query.class || '').toLowerCase();
+    if (klass) data = applyClassFilter(data, unit, klass);
+
+    const { items, total, pages, page: p } = paginate(data, page, limit);
+    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
 /** GET /trades/wallet/:address
- *  Window: tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
- *  unit=usd|zig
- *  direction=buy|sell|provide|withdraw
- *  includeLiquidity=1
- *  Optional scope: tokenId=<id|symbol|denom> OR pair=<pair_contract> OR poolId=<id>
- *  Pagination: limit (<=5000), offset
+ *  New pagination: page/limit. Optional: class=, combineRouter=1
  */
 router.get('/wallet/:address', async (req, res) => {
   try {
     const address = req.params.address;
     const unit    = String(req.query.unit || 'usd').toLowerCase();
-    const limit   = clampInt(req.query.limit,  { min:1, max:5000, def:1000 });
-    const offset  = clampInt(req.query.offset, { min:0, max:1e9,  def:0    });
+    const page    = parsePage(req.query.page);
+    const limit   = parseLimit(req.query.limit);
     const dir     = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
+    const combine = req.query.combineRouter === '1';
 
     const zigUsd = await getZigUsd();
 
@@ -457,49 +530,57 @@ router.get('/wallet/:address', async (req, res) => {
       params.push(String(req.query.poolId));
     }
 
+    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
+
     const sql = `
-      WITH base AS (
-        SELECT
-          t.*,
-          p.pair_contract,
-          p.is_uzig_quote,
-          q.exponent AS qexp,
-          b.exponent AS bexp,
-          b.denom    AS base_denom,
-          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
-          toff.exponent AS offer_exp,
-          task.exponent AS ask_exp,
-          COUNT(*) OVER() AS total
-        FROM trades t
-        JOIN pools  p ON p.pool_id = t.pool_id
-        JOIN tokens q ON q.token_id = p.quote_token_id
-        JOIN tokens b ON b.token_id = p.base_token_id
-        LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
-        LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
-        WHERE ${where.join(' AND ')}
-        ORDER BY t.created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      )
-      SELECT * FROM base
+      SELECT
+        t.*,
+        p.pair_contract,
+        p.is_uzig_quote,
+        q.exponent AS qexp,
+        b.exponent AS bexp,
+        b.denom    AS base_denom,
+        (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+        toff.exponent AS offer_exp,
+        task.exponent AS ask_exp
+      FROM trades t
+      JOIN pools  p ON p.pool_id = t.pool_id
+      JOIN tokens q ON q.token_id = p.quote_token_id
+      JOIN tokens b ON b.token_id = p.base_token_id
+      LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
+      LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
+      WHERE ${where.join(' AND ')}
+      ORDER BY t.created_at DESC
+      LIMIT ${sqlLimit}
     `;
 
     const { rows } = await DB.query(sql, params);
-    const data = rows.map(r => shapeRow(r, unit, zigUsd));
-    const total = rows[0]?.total ? Number(rows[0].total) : data.length;
+    let data = rows.map(r => shapeRow(r, unit, zigUsd));
 
-    res.json({ success:true, data, meta:{ unit, tf:req.query.tf || '24h', limit, offset, total } });
+    if (combine) data = combineRouterTrades(data, unit);
+
+    const klass = String(req.query.class || '').toLowerCase();
+    if (klass) data = applyClassFilter(data, unit, klass);
+
+    const { items, total, pages, page: p } = paginate(data, page, limit);
+    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf || '24h', limit, page: p, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
-/** GET /trades/large?bucket=30m|1h|4h|24h&unit=zig|usd&minValue=&maxValue= */
+/** GET /trades/large
+ *  Now supports: class=shrimp|shark|whale and page/limit
+ */
 router.get('/large', async (req, res) => {
   try {
     const bucket = (req.query.bucket || '24h').toLowerCase();
     const unit   = (req.query.unit || 'zig').toLowerCase();
+    const page   = parsePage(req.query.page);
+    const limit  = parseLimit(req.query.limit);
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+    const klass  = String(req.query.class || '').toLowerCase();
     const zigUsd = await getZigUsd();
 
     const { rows } = await DB.query(`
@@ -520,40 +601,35 @@ router.get('/large', async (req, res) => {
       direction: r.direction,
       valueNative: Number(r.value_zig),
       valueUsd: Number(r.value_zig) * zigUsd,
-      createdAt: r.created_at
+      createdAt: r.created_at,
+      class: classifyByWorth(unit === 'usd' ? (Number(r.value_zig) * zigUsd) : Number(r.value_zig))
     }));
 
     if (minV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) >= minV);
     if (maxV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) <= maxV);
+    if (klass) data = data.filter(x => x.class === klass);
 
-    res.json({ success:true, data, meta:{ bucket, unit, minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
+    const { items, total, pages, page: p } = paginate(data, page, limit);
+    res.json({ success:true, data: items, meta:{ bucket, unit, limit, page: p, pages, total, minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
 /** GET /trades/recent
- *  Dashboard feed.
- *  Filters:
- *    - tokenId=<id|symbol|denom>  (optional; across all its pools)
- *    - pair=<pair_contract>       (optional)
- *    - poolId=<id>                (optional)
- *    - direction=buy|sell|provide|withdraw (optional)
- *    - includeLiquidity=1
- *    - unit=usd|zig
- *    - minValue, maxValue
- *    - tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
- *    - limit (<=2000, default 200), offset
+ *  Now supports: class=shrimp|shark|whale, combineRouter=1, and page/limit
  */
 router.get('/recent', async (req, res) => {
   try {
     const unit   = String(req.query.unit || 'usd').toLowerCase();
-    const limit  = clampInt(req.query.limit,  { min:1, max:2000, def:200 });
-    const offset = clampInt(req.query.offset, { min:0, max:1e9,  def:0   });
+    const page   = parsePage(req.query.page);
+    const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+    const klass  = String(req.query.class || '').toLowerCase();
+    const combine = req.query.combineRouter === '1';
 
     const zigUsd = await getZigUsd();
 
@@ -590,6 +666,8 @@ router.get('/recent', async (req, res) => {
       params.push(String(req.query.poolId));
     }
 
+    const sqlLimit = computeSqlFetchLimit(page, limit, 2000);
+
     const sql = `
       SELECT
         t.*,
@@ -609,7 +687,7 @@ router.get('/recent', async (req, res) => {
       LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
       WHERE ${where.join(' AND ')}
       ORDER BY t.created_at DESC
-      LIMIT ${limit} OFFSET ${offset}
+      LIMIT ${sqlLimit}
     `;
 
     const { rows } = await DB.query(sql, params);
@@ -617,8 +695,11 @@ router.get('/recent', async (req, res) => {
 
     if (minV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) >= minV);
     if (maxV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) <= maxV);
+    if (combine) data = combineRouterTrades(data, unit);
+    if (klass) data = applyClassFilter(data, unit, klass);
 
-    res.json({ success:true, data, meta:{ unit, limit, offset, tf: req.query.tf || '24h', minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
+    const { items, total, pages, page: p } = paginate(data, page, limit);
+    res.json({ success:true, data: items, meta:{ unit, limit, page: p, pages, total, tf: req.query.tf || '24h', minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }

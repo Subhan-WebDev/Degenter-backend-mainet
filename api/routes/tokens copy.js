@@ -169,9 +169,6 @@ router.get('/swap-list', async (req, res) => {
   }
 });
 
-/* =======================================================================
-   GET /tokens/:id  (returns BOTH: your original stats block **as-is** + rich meta)
-   ======================================================================= */
 router.get('/:id', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
@@ -181,24 +178,68 @@ router.get('/:id', async (req, res) => {
     const priceSource = (req.query.priceSource || 'best').toLowerCase();
     const sel = await resolvePoolSelection(tok.token_id, { priceSource, poolId: req.query.poolId });
 
+    // current native price for selected pool (if any)
     const pr = sel.pool?.pool_id
       ? await DB.query(
-          `SELECT price_in_zig FROM prices WHERE token_id=$1 AND pool_id=$2 ORDER BY updated_at DESC LIMIT 1`,
+          `SELECT price_in_zig 
+             FROM prices 
+            WHERE token_id=$1 AND pool_id=$2 
+         ORDER BY updated_at DESC 
+            LIMIT 1`,
           [tok.token_id, sel.pool.pool_id]
         )
       : { rows: [] };
     const priceNative = pr.rows[0]?.price_in_zig != null ? Number(pr.rows[0].price_in_zig) : null;
 
+    // token static fields
     const srow = await DB.query(`
       SELECT total_supply_base, max_supply_base, exponent, image_uri, website, twitter, telegram, description
-      FROM tokens WHERE token_id=$1
+        FROM tokens WHERE token_id=$1
     `, [tok.token_id]);
     const s = srow.rows[0] || {};
     const exp = s.exponent != null ? Number(s.exponent) : 6;
     const circ = disp(s.total_supply_base, exp);
-    const max  = disp(s.max_supply_base, exp);
+    const max  = disp(s.max_supply_base,   exp);
 
-    // stats aggregates across all pools (4 buckets)
+    // ==== LIVE TVL (sum across this token's UZIG-quoted pools) ===========
+    // TVL_zig(pool) = token_reserve_disp * mid(price_in_zig) + zig_reserve_disp
+    // TVL_usd       = TVL_zig * zigUsd
+    const live = await DB.query(`
+      SELECT
+        p.pool_id,
+        ps.reserve_base_base   AS res_base_base,
+        ps.reserve_quote_base  AS res_quote_base,
+        tb.exponent            AS base_exp,
+        tq.exponent            AS quote_exp,
+        (
+          SELECT price_in_zig
+            FROM prices pr
+           WHERE pr.pool_id = p.pool_id
+             AND pr.token_id = p.base_token_id
+        ORDER BY pr.updated_at DESC
+           LIMIT 1
+        ) AS price_in_zig
+      FROM pools p
+      LEFT JOIN pool_state ps   ON ps.pool_id   = p.pool_id
+      JOIN tokens tb            ON tb.token_id  = p.base_token_id
+      JOIN tokens tq            ON tq.token_id  = p.quote_token_id
+      WHERE p.base_token_id = $1
+        AND p.is_uzig_quote = TRUE
+    `, [tok.token_id]);
+
+    let tvlZigSum = 0;
+    for (const r of live.rows) {
+      const Rt = Number(r.res_base_base  || 0) / Math.pow(10, Number(r.base_exp  ?? 0)); // token reserve (display)
+      const Rz = Number(r.res_quote_base || 0) / Math.pow(10, Number(r.quote_exp ?? 0)); // ZIG reserve (display)
+      const midZig = Number(r.price_in_zig || 0); // zig per token
+      const tvlZigPool = (Rt * midZig) + Rz;
+      if (Number.isFinite(tvlZigPool)) tvlZigSum += tvlZigPool;
+    }
+    const liquidityNativeZig = tvlZigSum;            // ZIG
+    const liquidityUSD       = liquidityNativeZig * zigUsd; // USD
+    // =====================================================================
+
+    // stats aggregates across all pools (four buckets)
     const buckets = ['30m','1h','4h','24h'];
     const agg = await DB.query(`
       SELECT pm.bucket,
@@ -208,11 +249,11 @@ router.get('/:id', async (req, res) => {
              COALESCE(SUM(pm.tx_sell),0)        AS tsell,
              COALESCE(SUM(pm.unique_traders),0) AS uniq,
              COALESCE(SUM(pm.tvl_zig),0)        AS tvl
-      FROM pools p
-      JOIN pool_matrix pm ON pm.pool_id=p.pool_id
-      WHERE p.base_token_id=$1
-        AND pm.bucket = ANY($2)
-      GROUP BY pm.bucket
+        FROM pools p
+        JOIN pool_matrix pm ON pm.pool_id=p.pool_id
+       WHERE p.base_token_id=$1
+         AND pm.bucket = ANY($2)
+       GROUP BY pm.bucket
     `, [tok.token_id, buckets]);
 
     const map = new Map(agg.rows.map(r => [r.bucket, {
@@ -245,18 +286,26 @@ router.get('/:id', async (req, res) => {
     const fdvNative = (priceNative != null && max  != null) ? max  * priceNative : null;
 
     // header meta counts
-    const poolsCount = (await DB.query(`SELECT COUNT(*)::int AS c FROM pools WHERE base_token_id=$1`, [tok.token_id])).rows[0]?.c || 0;
-    const holders    = (await DB.query(`SELECT holders_count FROM token_holders_stats WHERE token_id=$1`, [tok.token_id])).rows[0]?.holders_count || 0;
-    const creation   = (await DB.query(`SELECT MIN(created_at) AS first_ts FROM pools WHERE base_token_id=$1`, [tok.token_id])).rows[0]?.first_ts || null;
+    const poolsCount = (await DB.query(
+      `SELECT COUNT(*)::int AS c FROM pools WHERE base_token_id=$1`, [tok.token_id]
+    )).rows[0]?.c || 0;
+
+    const holders = (await DB.query(
+      `SELECT holders_count FROM token_holders_stats WHERE token_id=$1`, [tok.token_id]
+    )).rows[0]?.holders_count || 0;
+
+    const creation = (await DB.query(
+      `SELECT MIN(created_at) AS first_ts FROM pools WHERE base_token_id=$1`, [tok.token_id]
+    )).rows[0]?.first_ts || null;
 
     // socials (twitter block)
     const tw = await DB.query(`
       SELECT handle, user_id, name, is_blue_verified, verified_type, profile_picture, cover_picture,
              followers, following, created_at_twitter, last_refreshed
-      FROM token_twitter WHERE token_id=$1
+        FROM token_twitter WHERE token_id=$1
     `, [tok.token_id]);
 
-    // === RESPONSE: meta block + your original stats block fields (unchanged names) ===
+    // === RESPONSE =========================================================
     res.json({
       success: true,
       data: {
@@ -285,7 +334,7 @@ router.get('/:id', async (req, res) => {
           }
         } : {},
 
-        // Also expose a compact price sub-object for convenience
+        // Compact price object
         price: {
           source: priceSource,
           poolId: sel.pool?.pool_id ? String(sel.pool.pool_id) : null,
@@ -294,12 +343,12 @@ router.get('/:id', async (req, res) => {
           changePct: priceChange
         },
 
-        // Supply + caps in blocks
+        // Supply + caps
         supply: { circulating: circ, max },
         mcap:   { native: mcNative, usd: mcNative != null ? mcNative * zigUsd : null },
         fdv:    { native: fdvNative, usd: fdvNative != null ? fdvNative * zigUsd : null },
 
-        // ===== Your ORIGINAL block (names/shape preserved) =====
+        // ===== Original block (names preserved) =====
         priceInNative: priceNative,
         priceInUsd: priceNative != null ? priceNative * zigUsd : null,
         priceSource: priceSource,
@@ -307,7 +356,7 @@ router.get('/:id', async (req, res) => {
         pools: poolsCount,
         holder: holders,
         creationTime: creation,
-        supply: max ?? circ,                   // original field
+        supply: max ?? circ, // original field
         circulatingSupply: circ,
         fdvNative,
         fdv: fdvNative != null ? fdvNative * zigUsd : null,
@@ -319,16 +368,18 @@ router.get('/:id', async (req, res) => {
         txBuckets,
         uniqueTraders: r24.uniq,
         trade: r24.tbuy + r24.tsell,
-        sell: r24.tsell,
-        buy:  r24.tbuy,
+        sell:  r24.tsell,
+        buy:   r24.tbuy,
         v: r24.vbuy + r24.vsell,
         vBuy: r24.vbuy,
         vSell: r24.vsell,
         vUSD: (r24.vbuy + r24.vsell) * zigUsd,
         vBuyUSD: r24.vbuy * zigUsd,
         vSellUSD: r24.vsell * zigUsd,
-        tradeCount: { buy: r24.tbuy, sell: r24.tsell, total: r24.tbuy + r24.tsell },
-        liquidity: r24.tvl
+
+        // >>> fixed liquidity <<<
+        liquidity: liquidityUSD,                 // USD
+        liquidityNative: liquidityNativeZig      // ZIG (extra, non-breaking)
       }
     });
   } catch (e) {
@@ -641,6 +692,22 @@ function tfToSec(tf) {
   if (!g) return 60;
   return Number(g[1]) * (m[g[2]] || 60);
 }
+/* =======================================================================
+   GET /tokens/:id/ohlcv  (timezone-safe, numeric bucket keys)
+   ======================================================================= */
+
+// Helpers (no SQL change)
+function toEpochSecUtc(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return v > 1e12 ? Math.floor(v / 1000) : Math.floor(v);
+  if (v instanceof Date) return Math.floor(v.getTime() / 1000);
+  const s = String(v);
+  const ms = Date.parse(s.endsWith('Z') ? s : s + 'Z'); // treat as UTC
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+function alignFloorSec(sec, stepSec) {
+  return Math.floor(sec / stepSec) * stepSec;
+}
 
 router.get('/:id/ohlcv', async (req, res) => {
   try {
@@ -649,12 +716,12 @@ router.get('/:id/ohlcv', async (req, res) => {
 
     const tf = (req.query.tf || '1m');
     const stepSec = tfToSec(tf);
-    const mode = (req.query.mode || 'price').toLowerCase();         // price|mcap
-    const unit = (req.query.unit || 'native').toLowerCase();        // native|usd
-    const priceSource = (req.query.priceSource || 'best').toLowerCase(); // best|first|pool|all
+    const mode = (req.query.mode || 'price').toLowerCase();                 // price|mcap
+    const unit = (req.query.unit || 'native').toLowerCase();                // native|usd
+    const priceSource = (req.query.priceSource || 'best').toLowerCase();    // best|first|pool|all
     const poolIdParam = req.query.poolId;
     const pairParam   = req.query.pair;
-    const fill = (req.query.fill || 'none').toLowerCase();          // prev|zero|none
+    const fill = (req.query.fill || 'none').toLowerCase();                  // prev|zero|none
 
     // resolve time window:
     const now = new Date();
@@ -663,30 +730,26 @@ router.get('/:id/ohlcv', async (req, res) => {
 
     if (!fromIso) {
       if (req.query.span) {
-        // span like 7d, 3h, etc.
         const spanSec = tfToSec(req.query.span);
         const to = new Date(toIso);
-        const from = new Date(to.getTime() - spanSec*1000);
-        fromIso = from.toISOString();
+        fromIso = new Date(to.getTime() - spanSec*1000).toISOString();
       } else if (req.query.window) {
-        // fixed number of bars
         const bars = Math.max(1, Math.min(parseInt(req.query.window,10) || 300, 5000));
         const to = new Date(toIso);
-        const from = new Date(to.getTime() - bars*stepSec*1000);
-        fromIso = from.toISOString();
+        fromIso = new Date(to.getTime() - bars*stepSec*1000).toISOString();
       } else {
-        // default: 24h for 1m, else ~300 bars
-        const bars =  tf === '1m' ? 1440 : 300;
+        const bars = tf === '1m' ? 1440 : 300;
         fromIso = new Date(new Date(toIso).getTime() - bars*stepSec*1000).toISOString();
       }
     }
 
     const zigUsd = await getZigUsd();
 
-    // supply (for mcap)
+    // supply (for mcap conversion)
     const ss = await DB.query(`SELECT total_supply_base, exponent FROM tokens WHERE token_id=$1`, [tok.token_id]);
     const exp = ss.rows[0]?.exponent!= null ? Number(ss.rows[0]?.exponent) : 6;
     const circ = ss.rows[0]?.total_supply_base != null ? Number(ss.rows[0].total_supply_base) / 10**exp : null;
+
     // resolve pool set:
     let headerSQL = ``;
     let params = [];
@@ -702,7 +765,6 @@ router.get('/:id/ohlcv', async (req, res) => {
         ),
       `;
     } else {
-      // force pool by id or pair
       let poolRow = null;
       if (priceSource === 'pool' && (poolIdParam || pairParam)) {
         const { rows } = await DB.query(
@@ -729,7 +791,7 @@ router.get('/:id/ohlcv', async (req, res) => {
       `;
     }
 
-    // aggregate 1m into requested tf; keep volume & trades
+    // aggregate 1m into requested tf (unchanged SQL)
     const { rows } = await DB.query(`
       ${headerSQL}
       tagged AS (
@@ -764,63 +826,117 @@ router.get('/:id/ohlcv', async (req, res) => {
       ORDER BY ts ASC
     `, params);
 
-    // JS gap fill (prev/zero/none)
-    const out = [];
-    const start = Math.floor(new Date(fromIso).getTime() / 1000 / stepSec) * stepSec;
-    const end   = Math.floor(new Date(toIso).getTime()   / 1000 / stepSec) * stepSec;
-    const byTs = new Map(rows.map(r => [String(new Date(r.ts).getTime()), r]));
-    let prevClose = null;
+    // ---- JS gap fill using numeric seconds (no Date-string keys) ----
+   // ---------- JS gap fill with smooth opens (no SQL / endpoint changes) ----------
+const out = [];
 
-    for (let ts = start; ts <= end; ts += stepSec) {
-      const key = String(ts * 1000);
-      const r = byTs.get(key);
-      if (r) {
-        const base = {
-          ts: new Date(ts * 1000).toISOString(),
-          open: Number(r.open),
-          high: Number(r.high),
-          low:  Number(r.low),
-          close:Number(r.close),
-          volume: Number(r.volume_native),
-          trades: Number(r.trades)
-        };
-        prevClose = base.close;
-        out.push(base);
-      } else if (fill !== 'none' && prevClose != null) {
-        const filler = {
-          ts: new Date(ts * 1000).toISOString(),
-          open: prevClose,
-          high: prevClose,
-          low:  prevClose,
-          close:prevClose,
-          volume: 0,
-          trades: 0
-        };
-        out.push(filler);
-      }
+// bucket range in *seconds*
+const start = Math.floor(new Date(fromIso).getTime() / 1000 / stepSec) * stepSec;
+const end   = Math.floor(new Date(toIso).getTime()   / 1000 / stepSec) * stepSec;
+
+// Normalize any timestamp to UTC epoch seconds (avoid timezone drift)
+const toSec = (v) => {
+  if (v == null) return null;
+  if (typeof v === 'number') return v > 1e12 ? Math.floor(v / 1000) : Math.floor(v);
+  const s = String(v);
+  const ms = Date.parse(s.endsWith('Z') ? s : s + 'Z');
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+};
+
+// Build a map keyed by bucket second
+const bySec = new Map(
+  rows
+    .map(r => ({
+      sec: toSec(r.ts),
+      open: Number(r.open),
+      high: Number(r.high),
+      low:  Number(r.low),
+      close: Number(r.close),
+      volume: Number(r.volume_native),
+      trades: Number(r.trades)
+    }))
+    .filter(r => r.sec != null)
+    .map(r => [r.sec, r])
+);
+
+// We will (a) fill missing buckets flat at prevClose
+//       and (b) force the *first real bucket after a gap* to open at prevClose
+let prevClose = null;
+
+for (let ts = start; ts <= end; ts += stepSec) {
+  const r = bySec.get(ts);
+
+  if (r) {
+    // Smooth open: use previous close if we have one
+    const openAdj = (prevClose != null) ? prevClose : r.open;
+    const highAdj = Math.max(r.high, openAdj);
+    const lowAdj  = Math.min(r.low,  openAdj);
+
+    const base = {
+      ts: new Date(ts * 1000).toISOString(),
+      open: openAdj,
+      high: highAdj,
+      low:  lowAdj,
+      close: r.close,
+      volume: r.volume,
+      trades: r.trades
+    };
+    out.push(base);
+    prevClose = base.close; // advance
+  } else if (fill !== 'none') {
+    if (fill === 'prev' && prevClose != null) {
+      out.push({
+        ts: new Date(ts * 1000).toISOString(),
+        open: prevClose,
+        high: prevClose,
+        low:  prevClose,
+        close: prevClose,
+        volume: 0,
+        trades: 0
+      });
+      // prevClose unchanged
+    } else if (fill === 'zero') {
+      out.push({
+        ts: new Date(ts * 1000).toISOString(),
+        open: 0, high: 0, low: 0, close: 0,
+        volume: 0, trades: 0
+      });
+      prevClose = 0;
     }
+  }
+}
 
-    // convert to mcap or usd if requested
-    const conv = out.map(b => {
-      let o = { ...b };
-      if (mode === 'mcap' && circ != null) {
-        o.open  = o.open  * circ;
-        o.high  = o.high  * circ;
-        o.low   = o.low   * circ;
-        o.close = o.close * circ;
-      }
-      if (unit === 'usd') {
-        o.open  *= zigUsd; o.high *= zigUsd; o.low *= zigUsd; o.close *= zigUsd;
-        o.volume*= zigUsd;
-      }
-      return o;
-    });
+// ---------- optional conversions (unchanged behavior) ----------
+const conv = out.map(b => {
+  let o = { ...b };
+  if (mode === 'mcap' && circ != null) {
+    o.open  = o.open  * circ;
+    o.high  = o.high  * circ;
+    o.low   = o.low   * circ;
+    o.close = o.close * circ;
+  }
+  if (unit === 'usd') {
+    o.open  *= zigUsd; o.high *= zigUsd; o.low *= zigUsd; o.close *= zigUsd;
+    o.volume*= zigUsd;
+  }
+  return o;
+});
 
-    res.json({ success:true, data: conv, meta:{ tf, mode, unit, fill, priceSource, poolId: (params[0] && priceSource!=='all') ? String(params[0]) : null } });
+// ---------- response ----------
+res.json({
+  success: true,
+  data: conv,
+  meta: {
+    tf, mode, unit, fill, priceSource,
+    poolId: (params[0] && priceSource !== 'all') ? String(params[0]) : null
+  }
+});
+
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
+
 
 
 export default router;
