@@ -106,6 +106,178 @@ router.get('/', async (req, res) => {
 });
 
 /* =======================================================================
+   GET /tokens/gainers  &  /tokens/losers
+   - Ranks by 24h price change (%), computed from selected priceSource pool
+   - Query: bucket=24h|1h|... (affects volume fields only), priceSource=best|uzig|pool
+            limit<=200 (default 100), offset (default 0)
+   ======================================================================= */
+
+router.get('/gainers', async (req, res) => {
+  try {
+    const bucket = (req.query.bucket || '24h').toLowerCase();
+    const priceSource = (req.query.priceSource || 'best').toLowerCase();
+    const outLimit = Math.max(1, Math.min(parseInt(req.query.limit || '100', 10), 200));
+    const outOffset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const zigUsd = await getZigUsd();
+
+    // Fetch a broad set first (we’ll sort by change then paginate)
+    const FETCH_LIMIT = 1000;
+
+    const rows = await DB.query(`
+      WITH agg AS (
+        SELECT p.base_token_id AS token_id,
+               SUM(pm.vol_buy_zig + pm.vol_sell_zig) AS vol_zig,
+               SUM(pm.tx_buy + pm.tx_sell) AS tx
+        FROM pool_matrix pm
+        JOIN pools p ON p.pool_id=pm.pool_id
+        WHERE pm.bucket=$1
+        GROUP BY p.base_token_id
+      ),
+      base AS (
+        SELECT t.token_id, t.denom, t.symbol, t.name, t.image_uri, t.created_at,
+               tm.price_in_zig, tm.mcap_zig, tm.fdv_zig, tm.holders,
+               a.vol_zig, a.tx
+        FROM tokens t
+        LEFT JOIN token_matrix tm ON tm.token_id=t.token_id AND tm.bucket=$1
+        LEFT JOIN agg a ON a.token_id=t.token_id
+      )
+      SELECT * FROM base
+      LIMIT $2 OFFSET 0
+    `, [bucket, FETCH_LIMIT]);
+
+    // compute change24hPct via your pool-selection logic
+    const changeMap = new Map();
+    await Promise.all(rows.rows.map(async r => {
+      const sel = await resolvePoolSelection(r.token_id, { priceSource });
+      if (!sel?.pool?.pool_id) { changeMap.set(String(r.token_id), null); return; }
+      const pct = await changePctForMinutes(sel.pool.pool_id, 1440);
+      changeMap.set(String(r.token_id), pct);
+    }));
+
+    const data = rows.rows.map(r => {
+      const priceN = r.price_in_zig == null ? null : Number(r.price_in_zig);
+      const volN   = r.vol_zig == null ? 0 : Number(r.vol_zig);
+      const mcapN  = r.mcap_zig == null ? null : Number(r.mcap_zig);
+      const fdvN   = r.fdv_zig  == null ? null : Number(r.fdv_zig);
+      return {
+        tokenId: r.token_id,
+        denom: r.denom,
+        symbol: r.symbol,
+        name: r.name,
+        imageUri: r.image_uri,
+        createdAt: r.created_at,
+        priceNative: priceN,
+        priceUsd: priceN != null ? priceN * zigUsd : null,
+        mcapNative: mcapN, mcapUsd: mcapN != null ? mcapN * zigUsd : null,
+        fdvNative: fdvN,  fdvUsd:  fdvN  != null ? fdvN  * zigUsd : null,
+        holders: Number(r.holders || 0),
+        volNative: volN, volUsd: volN * zigUsd,
+        tx: Number(r.tx || 0),
+        change24hPct: changeMap.get(String(r.token_id))
+      };
+    });
+
+    // Sort by change desc (gainers), then paginate
+    const sorted = data
+      .filter(x => x.change24hPct != null)
+      .sort((a,b) => b.change24hPct - a.change24hPct);
+
+    const total = sorted.length;
+    const pageItems = sorted.slice(outOffset, outOffset + outLimit);
+
+    res.json({
+      success: true,
+      data: pageItems,
+      meta: { board: 'gainers', bucket, priceSource, limit: outLimit, offset: outOffset, total }
+    });
+  } catch (e) {
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
+
+router.get('/losers', async (req, res) => {
+  try {
+    const bucket = (req.query.bucket || '24h').toLowerCase();
+    const priceSource = (req.query.priceSource || 'best').toLowerCase();
+    const outLimit = Math.max(1, Math.min(parseInt(req.query.limit || '100', 10), 200));
+    const outOffset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const zigUsd = await getZigUsd();
+
+    const FETCH_LIMIT = 1000;
+
+    const rows = await DB.query(`
+      WITH agg AS (
+        SELECT p.base_token_id AS token_id,
+               SUM(pm.vol_buy_zig + pm.vol_sell_zig) AS vol_zig,
+               SUM(pm.tx_buy + pm.tx_sell) AS tx
+        FROM pool_matrix pm
+        JOIN pools p ON p.pool_id=pm.pool_id
+        WHERE pm.bucket=$1
+        GROUP BY p.base_token_id
+      ),
+      base AS (
+        SELECT t.token_id, t.denom, t.symbol, t.name, t.image_uri, t.created_at,
+               tm.price_in_zig, tm.mcap_zig, tm.fdv_zig, tm.holders,
+               a.vol_zig, a.tx
+        FROM tokens t
+        LEFT JOIN token_matrix tm ON tm.token_id=t.token_id AND tm.bucket=$1
+        LEFT JOIN agg a ON a.token_id=t.token_id
+      )
+      SELECT * FROM base
+      LIMIT $2 OFFSET 0
+    `, [bucket, FETCH_LIMIT]);
+
+    const changeMap = new Map();
+    await Promise.all(rows.rows.map(async r => {
+      const sel = await resolvePoolSelection(r.token_id, { priceSource });
+      if (!sel?.pool?.pool_id) { changeMap.set(String(r.token_id), null); return; }
+      const pct = await changePctForMinutes(sel.pool.pool_id, 1440);
+      changeMap.set(String(r.token_id), pct);
+    }));
+
+    const data = rows.rows.map(r => {
+      const priceN = r.price_in_zig == null ? null : Number(r.price_in_zig);
+      const volN   = r.vol_zig == null ? 0 : Number(r.vol_zig);
+      const mcapN  = r.mcap_zig == null ? null : Number(r.mcap_zig);
+      const fdvN   = r.fdv_zig  == null ? null : Number(r.fdv_zig);
+      return {
+        tokenId: r.token_id,
+        denom: r.denom,
+        symbol: r.symbol,
+        name: r.name,
+        imageUri: r.image_uri,
+        createdAt: r.created_at,
+        priceNative: priceN,
+        priceUsd: priceN != null ? priceN * zigUsd : null,
+        mcapNative: mcapN, mcapUsd: mcapN != null ? mcapN * zigUsd : null,
+        fdvNative: fdvN,  fdvUsd:  fdvN  != null ? fdvN  * zigUsd : null,
+        holders: Number(r.holders || 0),
+        volNative: volN, volUsd: volN * zigUsd,
+        tx: Number(r.tx || 0),
+        change24hPct: changeMap.get(String(r.token_id))
+      };
+    });
+
+    // Sort by change asc (losers), then paginate
+    const sorted = data
+      .filter(x => x.change24hPct != null)
+      .sort((a,b) => a.change24hPct - b.change24hPct);
+
+    const total = sorted.length;
+    const pageItems = sorted.slice(outOffset, outOffset + outLimit);
+
+    res.json({
+      success: true,
+      data: pageItems,
+      meta: { board: 'losers', bucket, priceSource, limit: outLimit, offset: outOffset, total }
+    });
+  } catch (e) {
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
+
+
+/* =======================================================================
    GET /tokens/swap-list  (image + hooky stats for dropdown)
    ======================================================================= */
 router.get('/swap-list', async (req, res) => {
