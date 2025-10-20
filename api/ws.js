@@ -1,211 +1,344 @@
 // api/ws.js
 import { WebSocketServer } from 'ws';
-import { DB } from '../lib/db.js';
-import { resolveTokenId, getZigUsd } from './util/resolve-token.js';
 
-/* ---------- helpers shared with REST shaping ---------- */
+/**
+ * WebSocket streams:
+ *  - ohlcv: sends snapshot.ohlcv (200 bars) + ohlcv.delta upserts.
+ *           For tf>1m, the forming bucket is synthesized from 1m bars.
+ *  - trades (optional): sends snapshot.trades + trades.append.
+ *
+ * Requires Node 18+ (global fetch). If older, install node-fetch and import it.
+ */
 
-function scale(base, exp, fallback = 6) {
-  if (base == null) return null;
-  const e = (exp == null ? fallback : Number(exp));
-  return Number(base) / 10 ** e;
+// ---------- helpers ----------
+const TF_STEP = { '1m':60, '5m':300, '15m':900, '30m':1800, '1h':3600, '4h':14400, '1d':86400 };
+const validTf = (x='1m') => TF_STEP[String(x).toLowerCase()] ? String(x).toLowerCase() : '1m';
+const nowSec = () => Math.floor(Date.now()/1000);
+const floor  = (t, step) => Math.floor(t/step)*step;
+const toIso  = (s) => new Date(s*1000).toISOString();
+const isObj  = (v) => v && typeof v === 'object' && !Array.isArray(v);
+
+function send(ws, msg) {
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+function safeParse(s) { try { return JSON.parse(s); } catch { return null; } }
+
+let NEXT_STREAM_ID = 1;
+const newStreamId = () => `s${NEXT_STREAM_ID++}`;
+
+// ---------- resolve token via REST (lightweight) ----------
+async function resolveToken(base, tokenKey) {
+  try {
+    const r = await fetch(`${base}/tokens/${encodeURIComponent(tokenKey)}`, { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      if (j?.success !== false) return { tokenId: tokenKey };
+    }
+  } catch {}
+  // Let downstream fail if truly unknown
+  return { tokenId: tokenKey };
 }
 
-function shapeTradeRow(r, zigUsd) {
-  const offerScaled  = scale(r.offer_amount_base,  r.offer_exp,  r.offer_asset_denom === 'uzig' ? 6 : 6);
-  const askScaled    = scale(r.ask_amount_base,    r.ask_exp,    r.ask_asset_denom   === 'uzig' ? 6 : 6);
-  const returnScaled = scale(r.return_amount_base, r.qexp, 6);
+// ---------- OHLCV stream ----------
+class OhlcvStream {
+  constructor({ ws, streamId, tokenId, tf='1m', mode='price', unit='usd', priceSource='best', baseUrl }) {
+    this.ws = ws; this.id = streamId;
+    this.tokenId = tokenId;
+    this.tf = validTf(tf); this.step = TF_STEP[this.tf];
+    this.mode = mode; this.unit = unit; this.priceSource = priceSource;
+    this.baseUrl = baseUrl;
 
-  let valueZig = null;
-  if (r.is_uzig_quote) {
-    if (r.direction === 'buy')      valueZig = scale(r.offer_amount_base,  r.qexp, 6);
-    else if (r.direction === 'sell')valueZig = scale(r.return_amount_base, r.qexp, 6);
-    else {
-      valueZig = scale(
-        (r.offer_asset_denom === 'uzig' ? r.offer_amount_base :
-         r.ask_asset_denom   === 'uzig' ? r.ask_amount_base   :
-                                           r.return_amount_base),
-        r.qexp, 6
-      );
+    this.seq = 0;
+    this.timer = null;
+    this.lockSec = null; // last fully-closed TF bucket start
+  }
+
+  async fetchOhlcvRange(fromSec, toSec, tf = this.tf) {
+    const url = `${this.baseUrl}/tokens/${encodeURIComponent(this.tokenId)}/ohlcv`
+      + `?tf=${tf}&from=${encodeURIComponent(toIso(fromSec))}&to=${encodeURIComponent(toIso(toSec))}`
+      + `&mode=${this.mode}&unit=${this.unit}&priceSource=${this.priceSource}&fill=prev`;
+
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+
+    const json = await res.json();
+    const raw = Array.isArray(json?.data) ? json.data : [];
+    return raw.map(b => ({
+      tsSec: Number(b.ts_sec ?? b.ts ?? b.time ?? b.bucket_ts ?? b.bucket ?? Math.floor(Date.parse(String(b.ts||b.time))/1000)),
+      open: Number(b.open), high: Number(b.high), low: Number(b.low), close: Number(b.close),
+      volume: Number(b.volume ?? b.volume_native ?? 0),
+      trades: Number(b.trades ?? b.trade_count ?? 0),
+    })).filter(x => x.tsSec && [x.open,x.high,x.low,x.close].every(Number.isFinite))
+      .sort((a,b)=>a.tsSec-b.tsSec);
+  }
+
+  async fetch1mRange(fromSec, toSec) {
+    return this.fetchOhlcvRange(fromSec, toSec, '1m');
+  }
+
+  aggregateFormingFrom1m(bucketStart, mins) {
+    if (!mins.length) return null;
+    const open = mins[0].open;
+    const highs = [open, ...mins.map(m => m.high)];
+    const lows  = [open, ...mins.map(m => m.low)];
+    const close = mins.at(-1).close;
+    const volume = mins.reduce((s,m)=>s+(m.volume||0),0);
+    const trades = mins.reduce((s,m)=>s+(m.trades||0),0);
+    return { tsSec: bucketStart, open, high: Math.max(...highs), low: Math.min(...lows), close, volume, trades };
+  }
+
+  async snapshot() {
+    const end = nowSec();
+    const start = end - 200*this.step;
+
+    let data = [];
+    try {
+      data = await this.fetchOhlcvRange(start, end);
+    } catch (e) {
+      console.error(`[ohlcv ${this.tokenId} ${this.tf}] snapshot fetch failed:`, e.message);
+      data = [];
     }
-  } else {
-    const qPrice = r.pq_price_in_zig != null ? Number(r.pq_price_in_zig) : null;
-    if (qPrice != null) {
-      const quoteAmt =
-        r.direction === 'buy'
-          ? scale(r.offer_amount_base,  r.qexp, 6)
-          : (r.direction === 'sell'
-              ? scale(r.return_amount_base, r.qexp, 6)
-              : scale(
-                  (r.offer_asset_denom === r.ask_asset_denom
-                    ? r.offer_amount_base
-                    : (r.offer_asset_denom === 'uzig' ? r.offer_amount_base
-                      : (r.ask_asset_denom === 'uzig' ? r.ask_amount_base
-                        : r.return_amount_base))),
-                  r.qexp, 6
-                ));
-      valueZig = quoteAmt != null ? quoteAmt * qPrice : null;
+
+    const lastClosedStart = floor(end, this.step) - this.step;
+    this.lockSec = lastClosedStart;
+
+    this.seq += 1;
+    send(this.ws, {
+      type: 'snapshot.ohlcv',
+      streamId: this.id,
+      meta: { stepSec: this.step, priceSource: this.priceSource, lockSec: this.lockSec },
+      bars: data,
+      seq: this.seq,
+    });
+    console.log(`[ohlcv ${this.tokenId} ${this.tf}] snapshot ${data.length} bars, lockSec=${this.lockSec}`);
+  }
+
+  async tick() {
+    try {
+      const end = nowSec();
+      const lastClosedStart = floor(end, this.step) - this.step;
+      if (this.lockSec == null || lastClosedStart > this.lockSec) this.lockSec = lastClosedStart;
+
+      // recent closed TF tail (overlap)
+      const tfTailFrom = end - 3*this.step;
+      let tfTail = [];
+      try {
+        tfTail = await this.fetchOhlcvRange(tfTailFrom, end);
+      } catch (e) {
+        console.error(`[ohlcv ${this.tokenId} ${this.tf}] tick tf fetch failed:`, e.message);
+      }
+
+      // forming synthesized from 1m for tf>1m
+      let forming = null;
+      if (this.step > 60) {
+        const bucketStart = floor(end, this.step);
+        const formingEnd  = end - 1;
+        try {
+          const mins = await this.fetch1mRange(bucketStart, formingEnd);
+          forming = this.aggregateFormingFrom1m(bucketStart, mins);
+        } catch (e) {
+          console.error(`[ohlcv ${this.tokenId} ${this.tf}] 1m forming fetch failed:`, e.message);
+        }
+      }
+
+      const upserts = [...tfTail];
+      if (forming) {
+        const i = upserts.findIndex(b => b.tsSec === forming.tsSec);
+        if (i >= 0) upserts[i] = forming; else upserts.push(forming);
+      }
+
+      if (upserts.length) {
+        this.seq += 1;
+        send(this.ws, {
+          type: 'ohlcv.delta',
+          streamId: this.id,
+          upserts,
+          lockSec: this.lockSec,
+          seq: this.seq,
+        });
+      }
+    } catch (e) {
+      console.error(`[ohlcv ${this.tokenId} ${this.tf}] tick error:`, e);
+    } finally {
+      const ms = 900 + Math.floor(Math.random()*400);
+      clearTimeout(this.timer);
+      this.timer = setTimeout(()=>this.tick(), ms);
     }
   }
 
-  const valueUsd = valueZig != null ? valueZig * zigUsd : null;
+  async start() {
+    try {
+      console.log(`[ohlcv ${this.tokenId} ${this.tf}] start`);
+      await this.snapshot();
+    } catch (e) {
+      console.error(`[ohlcv ${this.tokenId} ${this.tf}] snapshot fatal:`, e);
+      const end = nowSec();
+      const lastClosedStart = floor(end, this.step) - this.step;
+      this.lockSec = lastClosedStart;
+      this.seq += 1;
+      send(this.ws, {
+        type: 'snapshot.ohlcv',
+        streamId: this.id,
+        meta: { stepSec: this.step, priceSource: this.priceSource, lockSec: this.lockSec },
+        bars: [],
+        seq: this.seq,
+      });
+    } finally {
+      this.tick();
+    }
+  }
 
-  return {
-    time: r.created_at,
-    txHash: r.tx_hash,
-    pairContract: r.pair_contract,
-    signer: r.signer,
-    direction: r.direction,
-    offerDenom: r.offer_asset_denom,
-    offerAmountBase: r.offer_amount_base,
-    offerAmount: offerScaled,
-    askDenom: r.ask_asset_denom,
-    askAmountBase: r.ask_amount_base,
-    askAmount: askScaled,
-    returnAmountBase: r.return_amount_base,
-    returnAmount: returnScaled,
-    valueNative: valueZig,
-    valueUsd
-  };
+  stop() { clearTimeout(this.timer); }
 }
 
-/* ---------- topic hub ---------- */
-// topic strings we support now:
-// - 'trades.stream'
-// - 'trades.stream.token:{idOrSymbolOrDenom}'
-// - 'trades.stream.pair:{pairContract}'
-
-export function startWS(server, { path = '/ws' } = {}) {
-  const wss = new WebSocketServer({ server, path });
-  const subs = new Map(); // topic -> Set<WebSocket>
-
-  function addSub(ws, topic) {
-    if (!subs.has(topic)) subs.set(topic, new Set());
-    subs.get(topic).add(ws);
-    ws._topics = ws._topics || new Set();
-    ws._topics.add(topic);
+// ---------- Trades stream (optional) ----------
+class TradesStream {
+  constructor({ ws, streamId, tokenId, unit='usd', baseUrl }) {
+    this.ws = ws; this.id = streamId; this.tokenId = tokenId;
+    this.unit = unit; this.baseUrl = baseUrl;
+    this.seq = 0;
+    this.timer = null;
+    this.lastIso = null;
   }
 
-  function removeSub(ws, topic) {
-    const set = subs.get(topic);
-    if (set) { set.delete(ws); if (set.size === 0) subs.delete(topic); }
-    if (ws._topics) ws._topics.delete(topic);
+  async fetchRecent(limit=200, startIso, endIso) {
+    const qs = new URLSearchParams();
+    qs.set('tokenId', this.tokenId);
+    qs.set('unit', this.unit);
+    qs.set('limit', String(limit));
+    if (startIso) qs.set('startTime', startIso);
+    if (endIso)   qs.set('endTime', endIso);
+    const url = `${this.baseUrl}/trades/recent?${qs.toString()}`;
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+    const j = await r.json();
+    const arr = Array.isArray(j?.data) ? j.data : [];
+    arr.sort((a,b)=>Date.parse(a.time)-Date.parse(b.time));
+    return arr;
   }
 
-  function broadcast(topic, msg) {
-    const set = subs.get(topic);
-    if (!set || set.size === 0) return;
-    const data = JSON.stringify(msg);
-    for (const ws of set) {
-      if (ws.readyState === ws.OPEN) ws.send(data);
+  async snapshot() {
+    let items = [];
+    try {
+      const now = new Date();
+      const past = new Date(now.getTime()-24*3600*1000);
+      items = await this.fetchRecent(200, past.toISOString(), now.toISOString());
+    } catch (e) {
+      console.error(`[trades ${this.tokenId}] snapshot failed:`, e.message);
+    }
+    this.lastIso = items.at(-1)?.time ?? null;
+    this.seq += 1;
+    send(this.ws, { type:'snapshot.trades', streamId:this.id, items, seq:this.seq });
+  }
+
+  async tick() {
+    try {
+      let items = [];
+      try {
+        items = await this.fetchRecent(200, this.lastIso || undefined, new Date().toISOString());
+      } catch (e) {
+        console.error(`[trades ${this.tokenId}] tick fetch failed:`, e.message);
+      }
+      if (items.length) {
+        this.lastIso = items.at(-1)?.time || this.lastIso;
+        this.seq += 1;
+        send(this.ws, { type:'trades.append', streamId:this.id, items, seq:this.seq });
+      }
+    } catch (e) {
+      console.error(`[trades ${this.tokenId}] tick error:`, e);
+    } finally {
+      clearTimeout(this.timer);
+      this.timer = setTimeout(()=>this.tick(), 2000);
     }
   }
 
-  // ping keepalive
-  const HEARTBEAT_MS = 25000;
-  setInterval(() => {
-    for (const client of wss.clients) {
-      if (client.readyState === client.OPEN) {
-        try { client.ping(); } catch {}
-      }
-    }
-  }, HEARTBEAT_MS);
+  async start() { await this.snapshot(); this.tick(); }
+  stop() { clearTimeout(this.timer); }
+}
 
-  wss.on('connection', (ws) => {
-    ws.send(JSON.stringify({ ok: true, hello: 'degenter-ws', path }));
+// ---------- bootstrap ----------
+export function startWS(httpServer, { path='/ws' } = {}) {
+  const wss = new WebSocketServer({ server: httpServer, path });
 
-    ws.on('message', async (raw) => {
-      let msg;
-      try { msg = JSON.parse(raw.toString()); }
-      catch { return ws.send(JSON.stringify({ ok:false, error:'invalid_json' })); }
+  wss.on('connection', async (ws, req) => {
+    const proto = (req.headers['x-forwarded-proto'] || '').toString().toLowerCase();
+    const scheme = proto === 'https' ? 'https' : 'http';
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    const baseUrl = `${scheme}://${host}`;
 
-      const op = String(msg.op || '').toLowerCase();
-      const topic = String(msg.topic || '');
+    console.log('[ws] client connected from', req.socket.remoteAddress, 'base=', baseUrl);
+    const streams = new Map(); // id -> stream
 
-      if (op === 'subscribe') {
-        addSub(ws, topic);
-        ws.send(JSON.stringify({ ok:true, subscribed: topic }));
+    send(ws, { type:'hello', serverTime: new Date().toISOString() });
+
+    ws.on('message', async raw => {
+      const msg = safeParse(String(raw));
+      if (!isObj(msg)) return;
+
+      if (msg.type === 'ping') { send(ws, { type:'pong', ts: msg.ts || Date.now() }); return; }
+
+      if (msg.type === 'subscribe' && Array.isArray(msg.streams)) {
+        const ack = [];
+        for (const spec of msg.streams) {
+          if (!isObj(spec)) continue;
+          const kind = String(spec.kind || '').toLowerCase();
+          const tokenKey = spec.tokenId || spec.token || spec.id;
+          if (!tokenKey) { send(ws, { type:'error', error:'missing tokenId' }); continue; }
+
+          let tokenRes;
+          try { tokenRes = await resolveToken(baseUrl, tokenKey); }
+          catch (e) { console.error('[ws] resolveToken failed:', e); send(ws, { type:'error', error:`cannot resolve token: ${tokenKey}` }); continue; }
+
+          const id = newStreamId();
+          let inst = null;
+          if (kind === 'ohlcv') {
+            inst = new OhlcvStream({
+              ws, streamId:id, tokenId: tokenRes.tokenId,
+              tf: spec.tf || '1m',
+              mode: spec.mode || 'price',
+              unit: spec.unit || 'usd',
+              priceSource: spec.priceSource || 'best',
+              baseUrl
+            });
+          } else if (kind === 'trades') {
+            inst = new TradesStream({
+              ws, streamId:id, tokenId: tokenRes.tokenId,
+              unit: spec.unit || 'usd',
+              baseUrl
+            });
+          } else {
+            send(ws, { type:'error', error:`unknown stream kind: ${kind}` });
+            continue;
+          }
+
+          streams.set(id, inst);
+          ack.push({ id, kind });
+          inst.start().catch(e => console.error(`[${kind}] start failed:`, e));
+        }
+        send(ws, { type:'subscribed', streams: ack });
         return;
       }
-      if (op === 'unsubscribe') {
-        removeSub(ws, topic);
-        ws.send(JSON.stringify({ ok:true, unsubscribed: topic }));
+
+      if (msg.type === 'unsubscribe' && Array.isArray(msg.streamIds)) {
+        for (const id of msg.streamIds) {
+          const inst = streams.get(id);
+          if (inst) { inst.stop(); streams.delete(id); }
+        }
+        send(ws, { type:'unsubscribed', streamIds: msg.streamIds });
         return;
       }
-      ws.send(JSON.stringify({ ok:false, error:'unknown_op' }));
     });
 
+    ws.on('error', (e) => console.error('[ws] socket error:', e?.message || e));
     ws.on('close', () => {
-      if (!ws._topics) return;
-      for (const t of ws._topics) removeSub(ws, t);
+      for (const [,inst] of streams) inst.stop();
+      streams.clear();
+      console.log('[ws] client closed');
     });
   });
 
-  /* ---------- light poller to push recent trades ---------- */
-  let lastSeenIso = null; // track latest created_at we’ve sent
-  async function pumpTrades() {
-    try {
-      const zigUsd = await getZigUsd();
-      // grab the freshest 200 trades since lastSeenIso (or last 10 minutes)
-      const tsClause = lastSeenIso
-        ? `t.created_at > $1::timestamptz`
-        : `t.created_at >= now() - INTERVAL '10 minutes'`;
-
-      const params = lastSeenIso ? [lastSeenIso] : [];
-      const { rows } = await DB.query(`
-        SELECT t.*, p.pair_contract, p.is_uzig_quote, q.exponent AS qexp,
-               (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
-               toff.exponent AS offer_exp,
-               task.exponent AS ask_exp
-        FROM trades t
-        JOIN pools  p ON p.pool_id = t.pool_id
-        JOIN tokens q ON q.token_id = p.quote_token_id
-        LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
-        LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
-        WHERE ${tsClause}
-          AND t.action IN ('swap','provide','withdraw')
-        ORDER BY t.created_at ASC
-        LIMIT 200
-      `, params);
-
-      if (rows.length) {
-        for (const r of rows) {
-          const shaped = shapeTradeRow(r, zigUsd);
-          // global
-          broadcast('trades.stream', { type:'trade', data: shaped });
-
-          // per-token (base token inferred via pair—do a quick lookup once)
-          // We can optionally cache pair->base_token_id if needed.
-          // Quick light join to discover base token for per-token topic:
-          const bt = await DB.query(
-            `SELECT b.symbol, b.denom, b.token_id
-             FROM pools p
-             JOIN tokens b ON b.token_id = p.base_token_id
-             WHERE p.pair_contract=$1
-             LIMIT 1`, [r.pair_contract]
-          );
-          if (bt.rows[0]) {
-            const tok = bt.rows[0];
-            const ids = new Set([String(tok.token_id), tok.symbol, tok.denom].filter(Boolean));
-            for (const ref of ids) {
-              broadcast(`trades.stream.token:${ref}`, { type:'trade', data: shaped });
-            }
-          }
-
-          // per-pair
-          broadcast(`trades.stream.pair:${r.pair_contract}`, { type:'trade', data: shaped });
-
-          lastSeenIso = r.created_at; // advance watermark
-        }
-      }
-    } catch (e) {
-      // soft-log to console; keep loop alive
-      // console.error('pumpTrades error', e);
-    } finally {
-      setTimeout(pumpTrades, 2000); // run again
-    }
-  }
-  pumpTrades();
-
+  console.log(`[ws] ready on ${path}`);
   return wss;
 }
