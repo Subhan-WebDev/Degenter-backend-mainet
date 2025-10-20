@@ -32,54 +32,12 @@ function parsePage(q) {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 }
 
-/** Fetch enough rows to cover (page * limit) before post-filters/combining */
-function computeSqlFetchLimit(page, limit, hardMax = 5000) {
-  const OVERSAMPLE = 5;                 // try 5–10 if needed
-  return Math.min(page * limit * OVERSAMPLE, hardMax);
-}
-
-function classifyByWorth(value /* number|null */) {
-  if (value == null) return null;
-  const x = Number(value);
-  if (x < 1000) return 'shrimp';
-  if (x <= 10000) return 'shark';
-  return 'whale';
-}
-
-function applyClassFilter(data, unit, klass) {
-  if (!klass) return data;
-  if (!VALID_CLASS.has(klass)) return data;
-  return data.filter(x => {
-    const worth = unit === 'usd' ? x.valueUsd : x.valueNative;
-    return classifyByWorth(worth) === klass;
-  });
-}
-
-function paginate(data, page, limit) {
-  const total = data.length;
-  const pages = Math.max(1, Math.ceil(total / limit));
-  const p = Math.min(page, pages);
-  const start = (p - 1) * limit;
-  const end = start + limit;
-  return {
-    items: data.slice(start, end),
-    total,
-    page: p,
-    pages,
-    limit
-  };
-}
-
-// scale base amount using exponent; uzig => 6 by default
-function scale(base, exp, fallback = 6) {
-  if (base == null) return null;
-  const e = (exp == null ? fallback : Number(exp));
-  return Number(base) / 10 ** e;
-}
-
-/** Expanded TF map */
+/** Dynamic + extended TF (accepts Xd like 60d) */
 function minutesForTf(tf) {
   const m = String(tf || '').toLowerCase();
+  const mDays = m.match(/^(\d+)d$/);
+  if (mDays) return Number(mDays[1]) * 1440;
+
   const map = {
     '30m': 30,
     '1h' : 60,
@@ -91,62 +49,64 @@ function minutesForTf(tf) {
     '1d' : 1440,
     '3d' : 4320,
     '5d' : 7200,
-    '7d' : 10080
+    '7d' : 10080,
+    '14d': 20160,
+    '30d': 43200,
+    '60d': 86400
   };
   return map[m] || 1440; // default 24h
 }
 
 /** Build time window clause + params */
-function buildWindow({ tf, from, to, days }, params) {
+function buildWindow({ tf, from, to, days }, params, alias = 't') {
   const clauses = [];
   if (from && to) {
-    clauses.push(`t.created_at >= $${params.length + 1}::timestamptz`);
+    clauses.push(`${alias}.created_at >= $${params.length + 1}::timestamptz`);
     params.push(from);
-    clauses.push(`t.created_at < $${params.length + 1}::timestamptz`);
+    clauses.push(`${alias}.created_at < $${params.length + 1}::timestamptz`);
     params.push(to);
     return { clause: clauses.join(' AND ') };
   }
   if (days) {
-    const d = clampInt(days, { min: 1, max: 60, def: 1 });
-    clauses.push(`t.created_at >= now() - ($${params.length + 1} || ' days')::interval`);
+    const d = clampInt(days, { min: 1, max: 365, def: 1 }); // cap raised
+    clauses.push(`${alias}.created_at >= now() - ($${params.length + 1} || ' days')::interval`);
     params.push(String(d));
     return { clause: clauses.join(' AND ') };
   }
-  // tf fallback
   const mins = minutesForTf(tf);
-  clauses.push(`t.created_at >= now() - INTERVAL '${mins} minutes'`);
+  clauses.push(`${alias}.created_at >= now() - INTERVAL '${mins} minutes'`);
   return { clause: clauses.join(' AND ') };
 }
 
-/** Shared SELECT block — conditions and params are appended safely */
-function buildTradesQuery({
-  scope,            // 'all' | 'token' | 'pool' | 'wallet'
-  scopeValue,       // token_id, {poolId}|{pairContract}, wallet
-  includeLiquidity, // boolean
-  direction,        // 'buy' | 'sell' | 'provide' | 'withdraw' | null
-  windowOpts,       // {tf, from, to, days}
-  sqlLimit, sqlOffset = 0
-}) {
-  const params = [];
+/** FROM/JOIN block for trades with a chosen alias */
+function tradesFromJoin(alias = 't') {
+  return `
+    FROM trades ${alias}
+    JOIN pools  p ON p.pool_id = ${alias}.pool_id
+    JOIN tokens q ON q.token_id = p.quote_token_id
+    JOIN tokens b ON b.token_id = p.base_token_id
+    LEFT JOIN tokens toff ON toff.denom = ${alias}.offer_asset_denom
+    LEFT JOIN tokens task ON task.denom = ${alias}.ask_asset_denom
+  `;
+}
+
+/** WHERE builder (without time) — scope/direction/includeLiquidity */
+function buildWhereBase({ scope, scopeValue, direction, includeLiquidity }, params, alias = 't') {
   const where = [];
+  if (includeLiquidity) where.push(`${alias}.action IN ('swap','provide','withdraw')`);
+  else where.push(`${alias}.action = 'swap'`);
 
-  // action filter
-  if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
-  else where.push(`t.action = 'swap'`);
-
-  // direction filter
   if (direction) {
-    where.push(`t.direction = $${params.length + 1}`);
+    where.push(`${alias}.direction = $${params.length + 1}`);
     params.push(direction);
   }
 
-  // scope filter (we always join base token `b` below)
   if (scope === 'token') {
     where.push(`b.token_id = $${params.length + 1}`);
-    params.push(scopeValue); // token_id (BIGINT)
+    params.push(scopeValue);
   } else if (scope === 'wallet') {
-    where.push(`t.signer = $${params.length + 1}`);
-    params.push(scopeValue); // address
+    where.push(`${alias}.signer = $${params.length + 1}`);
+    params.push(scopeValue);
   } else if (scope === 'pool') {
     if (scopeValue.poolId) {
       where.push(`p.pool_id = $${params.length + 1}`);
@@ -156,51 +116,18 @@ function buildTradesQuery({
       params.push(scopeValue.pairContract);
     }
   }
-
-  // window
-  const { clause } = buildWindow(windowOpts, params);
-  where.push(clause);
-
-  const sql = `
-    SELECT
-      t.*,
-      p.pair_contract,
-      p.is_uzig_quote,
-
-      -- quote token (right side of pair)
-      q.exponent AS qexp,
-
-      -- base token (left side of pair) — used to compute price per BASE
-      b.exponent AS bexp,
-      b.denom    AS base_denom,
-
-      -- latest price of QUOTE token in ZIG (when quote != uzig)
-      (SELECT price_in_zig
-         FROM prices
-        WHERE token_id = p.quote_token_id
-        ORDER BY updated_at DESC
-        LIMIT 1) AS pq_price_in_zig,
-
-      -- exponents of the trade legs
-      toff.exponent AS offer_exp,
-      task.exponent AS ask_exp
-    FROM trades t
-    JOIN pools  p ON p.pool_id = t.pool_id
-    JOIN tokens q ON q.token_id = p.quote_token_id
-    JOIN tokens b ON b.token_id = p.base_token_id
-    LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
-    LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
-    WHERE ${where.join(' AND ')}
-    ORDER BY t.created_at DESC
-    LIMIT ${sqlLimit} OFFSET ${sqlOffset}
-  `;
-
-  return { sql, params };
+  return where;
 }
 
-/** shape a trade row + compute value + per-trade price (ZIG per BASE) */
+/** scale helper for shaping (JS side) */
+function scale(base, exp, fallback = 6) {
+  if (base == null) return null;
+  const e = (exp == null ? fallback : Number(exp));
+  return Number(base) / 10 ** e;
+}
+
+/** shape one row into API response (keeps ZIG-leg + notional) */
 function shapeRow(r, unit, zigUsd) {
-  // scaled legs for response
   const offerScaled = scale(
     r.offer_amount_base,
     (r.offer_asset_denom === 'uzig') ? 6 : (r.offer_exp ?? 6),
@@ -213,74 +140,49 @@ function shapeRow(r, unit, zigUsd) {
     6
   );
 
-  // Two interpretations of return_amount_base
-  const returnAsQuote = scale(r.return_amount_base, r.qexp ?? 6, 6); // quote units
-  const returnAsBase  = scale(r.return_amount_base, r.bexp ?? 6, 6); // base units
+  const returnAsQuote = scale(r.return_amount_base, r.qexp ?? 6, 6);
+  const returnAsBase  = scale(r.return_amount_base, r.bexp ?? 6, 6);
 
-  // ------------------------------
-  // Notional value in ZIG (quote)
-  // ------------------------------
+  // notional in ZIG (quote)
   let valueZig = null;
   if (r.is_uzig_quote) {
-    if (r.direction === 'buy') {
-      valueZig = scale(r.offer_amount_base, r.qexp ?? 6, 6);  // paid quote
-    } else if (r.direction === 'sell') {
-      valueZig = scale(r.return_amount_base, r.qexp ?? 6, 6); // received quote
-    } else {
-      valueZig = (r.offer_asset_denom === 'uzig')
-        ? scale(r.offer_amount_base, r.qexp ?? 6, 6)
-        : (r.ask_asset_denom === 'uzig')
-          ? scale(r.ask_amount_base, r.qexp ?? 6, 6)
-          : returnAsQuote;
-    }
-  } else {
-    const qPrice = r.pq_price_in_zig != null ? Number(r.pq_price_in_zig) : null;
-    if (qPrice != null) {
-      const quoteAmt =
-        (r.direction === 'buy')
-          ? scale(r.offer_amount_base,  r.qexp ?? 6, 6)   // paid quote
-          : scale(r.return_amount_base, r.qexp ?? 6, 6);  // received quote
-      valueZig = quoteAmt != null ? quoteAmt * qPrice : null;
-    }
+    valueZig = (r.direction === 'buy')
+      ? scale(r.offer_amount_base, r.qexp ?? 6, 6)
+      : scale(r.return_amount_base, r.qexp ?? 6, 6);
+  } else if (r.pq_price_in_zig != null) {
+    const rawQuote = (r.direction === 'buy')
+      ? scale(r.offer_amount_base, r.qexp ?? 6, 6)
+      : scale(r.return_amount_base, r.qexp ?? 6, 6);
+    if (rawQuote != null) valueZig = rawQuote * Number(r.pq_price_in_zig);
   }
   const valueUsd = valueZig != null ? valueZig * zigUsd : null;
 
-  // ----------------------------------------
-  // Execution PRICE: ZIG per 1 BASE token
-  // ----------------------------------------
-  // base amount:
-  const baseAmt = (r.direction === 'buy')
-    ? returnAsBase                             // received base
-    : (r.direction === 'sell')
-      ? scale(r.offer_amount_base, r.bexp ?? 6, 6) // offered base
-      : null;
+  // ZIG-leg preferred for class
+  const zigLegAmount =
+    (r.offer_asset_denom === 'uzig' && offerScaled != null) ? offerScaled :
+    (r.ask_asset_denom   === 'uzig' && askScaled   != null) ? askScaled   :
+    null;
 
-  // quote amount in ZIG:
+  // price (ZIG per 1 BASE)
   let quoteAmtZig = null;
   if (r.is_uzig_quote) {
     quoteAmtZig = (r.direction === 'buy')
-      ? scale(r.offer_amount_base,  r.qexp ?? 6, 6)   // paid quote
-      : (r.direction === 'sell')
-        ? scale(r.return_amount_base, r.qexp ?? 6, 6) // received quote
-        : null;
-  } else {
-    const qPrice = r.pq_price_in_zig != null ? Number(r.pq_price_in_zig) : null;
-    if (qPrice != null) {
-      const rawQuote = (r.direction === 'buy')
-        ? scale(r.offer_amount_base,  r.qexp ?? 6, 6)
-        : (r.direction === 'sell')
-          ? scale(r.return_amount_base, r.qexp ?? 6, 6)
-          : null;
-      if (rawQuote != null) quoteAmtZig = rawQuote * qPrice;
-    }
+      ? scale(r.offer_amount_base, r.qexp ?? 6, 6)
+      : scale(r.return_amount_base, r.qexp ?? 6, 6);
+  } else if (r.pq_price_in_zig != null) {
+    const rawQuote = (r.direction === 'buy')
+      ? scale(r.offer_amount_base, r.qexp ?? 6, 6)
+      : scale(r.return_amount_base, r.qexp ?? 6, 6);
+    if (rawQuote != null) quoteAmtZig = rawQuote * Number(r.pq_price_in_zig);
   }
+  const baseAmt = (r.direction === 'buy')
+    ? returnAsBase
+    : (r.direction === 'sell')
+      ? scale(r.offer_amount_base, r.bexp ?? 6, 6)
+      : null;
 
-  const priceNative = (quoteAmtZig != null && baseAmt != null && baseAmt !== 0)
-    ? (quoteAmtZig / baseAmt)   // ZIG per 1 BASE
-    : null;
+  const priceNative = (quoteAmtZig != null && baseAmt != null && baseAmt !== 0) ? (quoteAmtZig / baseAmt) : null;
   const priceUsd = priceNative != null ? priceNative * zigUsd : null;
-
-  const cls = classifyByWorth((unit === 'usd') ? valueUsd : valueZig);
 
   return {
     time: r.created_at,
@@ -288,8 +190,7 @@ function shapeRow(r, unit, zigUsd) {
     pairContract: r.pair_contract,
     signer: r.signer,
     direction: r.direction,
-
-    is_router: r.is_router === true, // passthrough
+    is_router: r.is_router === true,
 
     offerDenom: r.offer_asset_denom,
     offerAmountBase: r.offer_amount_base,
@@ -300,60 +201,234 @@ function shapeRow(r, unit, zigUsd) {
     askAmount: askScaled,
 
     returnAmountBase: r.return_amount_base,
-    // For BUY this is base; for SELL this is quote
     returnAmount: (r.direction === 'buy') ? returnAsBase : returnAsQuote,
 
-    // per-trade execution price
-    priceNative,     // ZIG per 1 BASE
-    priceUsd,        // USD per 1 BASE
+    priceNative,
+    priceUsd,
 
-    // trade notional
     valueNative: valueZig,
     valueUsd,
 
-    class: cls
+    zigLegAmount
   };
 }
 
-/** Combine router legs by txHash, summing worth */
-function combineRouterTrades(items, unit /* 'usd'|'zig' */) {
-  const byTx = new Map();
-  for (const t of items) {
-    const key = t.txHash;
-    const cur = byTx.get(key);
-    if (!cur) {
-      byTx.set(key, { ...t, legs: [t] });
-    } else {
-      cur.legs.push(t);
-      // accumulate worth
-      cur.valueNative = (cur.valueNative ?? 0) + (t.valueNative ?? 0);
-      cur.valueUsd    = (cur.valueUsd ?? 0) + (t.valueUsd ?? 0);
-      // earliest time
-      cur.time = cur.time < t.time ? cur.time : t.time;
-      // mark router
-      cur.is_router = cur.is_router || t.is_router;
-    }
-  }
-  return Array.from(byTx.values()).map(x => {
-    if (!x.is_router) return x; // not a router aggregate — leave as-is
-    const first = x.legs[0];
-    return {
-      ...x,
-      pairContract: 'router',
-      direction: first.direction,
-      class: classifyByWorth(unit === 'usd' ? x.valueUsd : x.valueNative)
-    };
+/** worth basis (ZIG-leg preferred, else notional), unit-aware */
+function worthForClass(item, unit, zigUsd) {
+  const zigBasis = (item.zigLegAmount != null) ? item.zigLegAmount : item.valueNative;
+  if (zigBasis == null) return null;
+  return unit === 'usd' ? zigBasis * zigUsd : zigBasis;
+}
+function classifyByThreshold(x) {
+  if (x < 1000) return 'shrimp';
+  if (x <= 10000) return 'shark';
+  return 'whale';
+}
+function applyClassFilterJS(data, unit, klass, zigUsd) {
+  if (!klass || !VALID_CLASS.has(klass)) return data;
+  return data.filter(x => {
+    const w = worthForClass(x, unit, zigUsd);
+    if (w == null) return false;
+    return classifyByThreshold(w) === klass;
   });
 }
 
-/* ---------------- routes ---------------- */
+/** combine legs for router tx (for combineRouter modes) */
+function buildRouterCombined(legs, unit, zigUsd) {
+  const sorted = legs.slice().sort((a,b) => new Date(a.time) - new Date(b.time));
+  const first = sorted[0];
+  const last  = sorted[sorted.length - 1];
+  const valueNative = sorted.reduce((s,x)=>s+(x.valueNative||0),0);
+  const valueUsd    = sorted.reduce((s,x)=>s+(x.valueUsd||0),0);
+  const zigLegSum   = sorted.reduce((s,x)=>s+(x.zigLegAmount||0),0);
 
-/** GET /trades
- *  New pagination: page=1..N (default 1), limit=100|500|1000 (default 100)
- *  Optional: class=shrimp|shark|whale, combineRouter=1
- *  Window: tf=30m|1h|2h|4h|8h|12h|24h|1d|3d|5d|7d OR from&to OR days=1..60
- *  unit=usd|zig, direction=buy|sell|provide|withdraw, includeLiquidity=1
+  const toDenom  = (last.direction === 'buy') ? last.askDenom : (last.offerDenom || last.askDenom);
+  const amountIn  = first.offerAmount ?? null;
+  const amountOut = (last.direction === 'buy') ? last.returnAmount : (last.offerAmount ?? null);
+
+  const out = {
+    ...first,
+    pairContract: 'router',
+    is_router: true,
+    time: first.time,
+    direction: first.direction,
+    fromDenom: first.offerDenom,
+    toDenom,
+    path: sorted.map(l => ({ pair: l.pairContract, offerDenom: l.offerDenom, askDenom: l.askDenom })),
+    valueNative,
+    valueUsd,
+    amountIn,
+    amountOut,
+    legs: sorted,
+    zigLegAmount: zigLegSum
+  };
+  const w = worthForClass(out, unit, zigUsd);
+  out.class = w != null ? classifyByThreshold(w) : null;
+  return out;
+}
+function combineRouterTradesShallow(items, unit, zigUsd) {
+  const byTx = new Map();
+  for (const t of items) {
+    const cur = byTx.get(t.txHash);
+    if (!cur) byTx.set(t.txHash, [t]); else cur.push(t);
+  }
+  return Array.from(byTx.values()).map(legs => {
+    const anyRouter = legs.some(l => l.is_router);
+    return anyRouter ? buildRouterCombined(legs, unit, zigUsd) : legs[0];
+  });
+}
+async function fetchSiblingLegsByTx(txHashes, windowOpts) {
+  if (!txHashes.length) return [];
+  const params = [];
+  const { clause } = buildWindow(windowOpts, params, 't');
+  const inParams = txHashes.map((_, i) => `$${params.length + i + 1}`).join(',');
+  params.push(...txHashes);
+
+  const sql = `
+    SELECT
+      t.*,
+      p.pair_contract,
+      p.is_uzig_quote,
+      q.exponent AS qexp,
+      b.exponent AS bexp,
+      b.denom    AS base_denom,
+      (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+      toff.exponent AS offer_exp,
+      task.exponent AS ask_exp
+    ${tradesFromJoin('t')}
+    WHERE ${clause} AND t.tx_hash IN (${inParams})
+    ORDER BY t.created_at ASC
+  `;
+  const { rows } = await DB.query(sql, params);
+  return rows;
+}
+async function combineRouterTradesDeep(shaped, unit, windowOpts, zigUsd) {
+  const txSet = new Set(shaped.map(x => x.txHash));
+  if (!txSet.size) return shaped;
+  const siblings = await fetchSiblingLegsByTx(Array.from(txSet), windowOpts);
+  const shapedSiblings = siblings.map(r => shapeRow(r, unit, zigUsd));
+  const merged = new Map();
+  for (const row of [...shaped, ...shapedSiblings]) {
+    const arr = merged.get(row.txHash);
+    if (!arr) merged.set(row.txHash, [row]); else arr.push(row);
+  }
+  const out = [];
+  for (const legs of merged.values()) {
+    const anyRouter = legs.some(l => l.is_router);
+    out.push(anyRouter ? buildRouterCombined(legs, unit, zigUsd) : legs[0]);
+  }
+  return out;
+}
+
+function paginateArray(data, page, limit) {
+  const total = data.length;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const p = Math.min(page, pages);
+  const start = (p - 1) * limit;
+  const end = start + limit;
+  return { items: data.slice(start, end), total, page: p, pages, limit };
+}
+
+/**
+ * Build a fully paged SQL that:
+ * - applies scope/direction/includeLiquidity + time window
+ * - computes worth_zig via ZIG-leg-first (fallback notional) in DB
+ * - applies class/min/max in DB (unit-aware)
+ * - returns rows with COUNT(*) OVER() as total, ordered by created_at DESC
+ * Supports extraWhere clauses (e.g., tokenId/pair/poolId filters added by caller).
  */
+function buildWorthPagedSQL({
+  scope, scopeValue, direction, includeLiquidity,
+  windowOpts, page, limit, unit, klass, minValue, maxValue,
+  extraWhere = []
+}, params) {
+  // Base WHERE (t alias in base CTE)
+  const baseWhere = buildWhereBase({ scope, scopeValue, direction, includeLiquidity }, params, 't');
+
+  // Additional filters (tokenId/pair/poolId custom from caller)
+  if (Array.isArray(extraWhere) && extraWhere.length) baseWhere.push(...extraWhere);
+
+  // time window on t.*
+  const { clause: timeClause } = buildWindow(windowOpts, params, 't');
+  baseWhere.push(timeClause);
+
+  // FROM/JOIN
+  const fromJoin = tradesFromJoin('t');
+
+  // worthZig expression using base.* (ranked reads FROM base)
+  const worthZig = `
+    COALESCE(
+      CASE WHEN base.offer_asset_denom='uzig'
+           THEN base.offer_amount_base / POWER(10, COALESCE(base.offer_exp,6))
+           WHEN base.ask_asset_denom='uzig'
+           THEN base.ask_amount_base   / POWER(10, COALESCE(base.ask_exp,6))
+      END,
+      CASE WHEN base.is_uzig_quote THEN
+             CASE WHEN base.direction='buy'
+                  THEN base.offer_amount_base  / POWER(10, COALESCE(base.qexp,6))
+                  ELSE base.return_amount_base / POWER(10, COALESCE(base.qexp,6))
+             END
+           ELSE
+             (CASE WHEN base.direction='buy'
+                   THEN base.offer_amount_base  / POWER(10, COALESCE(base.qexp,6))
+                   ELSE base.return_amount_base / POWER(10, COALESCE(base.qexp,6))
+              END) * base.pq_price_in_zig
+      END
+    )
+  `;
+
+  // zigUsd param slot
+  const zigUsdIdx = params.length + 1;
+  params.push(0); // placeholder to be filled by caller
+  const worthUsd = `(${worthZig}) * $${zigUsdIdx}`;
+
+  // class/min/max filters (unit-aware) — these run in ranked WHERE
+  const filters = [];
+  const k = String(klass || '').toLowerCase();
+  if (VALID_CLASS.has(k)) {
+    if (k === 'shrimp') filters.push(unit === 'zig' ? `${worthZig} < 1000` : `${worthUsd} < 1000`);
+    if (k === 'shark')  filters.push(unit === 'zig' ? `${worthZig} >= 1000 AND ${worthZig} <= 10000`
+                                                   : `${worthUsd} >= 1000 AND ${worthUsd} <= 10000`);
+    if (k === 'whale')  filters.push(unit === 'zig' ? `${worthZig} > 10000` : `${worthUsd} > 10000`);
+  }
+  if (minValue != null) filters.push(unit === 'zig' ? `${worthZig} >= ${Number(minValue)}` : `${worthUsd} >= ${Number(minValue)}`);
+  if (maxValue != null) filters.push(unit === 'zig' ? `${worthZig} <= ${Number(maxValue)}` : `${worthUsd} <= ${Number(maxValue)}`);
+
+  const offset = (page - 1) * limit;
+
+  const sql = `
+    WITH base AS (
+      SELECT
+        t.*,
+        p.pair_contract,
+        p.is_uzig_quote,
+        q.exponent AS qexp,
+        b.exponent AS bexp,
+        b.denom    AS base_denom,
+        toff.exponent AS offer_exp,
+        task.exponent AS ask_exp,
+        (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig
+      ${fromJoin}
+      WHERE ${baseWhere.join(' AND ')}
+    ),
+    ranked AS (
+      SELECT base.*,
+             ${worthZig} AS worth_zig,
+             ${worthUsd} AS worth_usd,
+             COUNT(*) OVER() AS total
+      FROM base
+      ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+    )
+    SELECT * FROM ranked
+    ORDER BY created_at DESC
+    LIMIT ${limit} OFFSET ${offset}
+  `;
+  return { sql, params, zigUsdIdx };
+}
+
+/* ---------------- ROUTES ---------------- */
+
+/** GET /trades */
 router.get('/', async (req, res) => {
   try {
     const unit   = String(req.query.unit || 'usd').toLowerCase();
@@ -361,30 +436,76 @@ router.get('/', async (req, res) => {
     const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
-    const combine = req.query.combineRouter === '1';
+    const combine = String(req.query.combineRouter || '').toLowerCase();
+    const klass  = String(req.query.class || '').toLowerCase();
+    const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
+    const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
 
     const zigUsd = await getZigUsd();
+    const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
 
-    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
+    if (combine === 'deep' || combine === '1' || combine === 'true') {
+      // Combine path: oversample, shape, combine, filter, paginate in JS
+      const sqlLimit = Math.min(limit * 20, 20000);
+      const params = [];
+      const where = buildWhereBase({ scope:'all', scopeValue:null, direction:dir, includeLiquidity }, params, 't');
+      const { clause } = buildWindow(windowOpts, params, 't');
+      where.push(clause);
 
-    const { sql, params } = buildTradesQuery({
+      const sql = `
+        SELECT
+          t.*,
+          p.pair_contract,
+          p.is_uzig_quote,
+          q.exponent AS qexp,
+          b.exponent AS bexp,
+          b.denom    AS base_denom,
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+          toff.exponent AS offer_exp,
+          task.exponent AS ask_exp
+        ${tradesFromJoin('t')}
+        WHERE ${where.join(' AND ')}
+        ORDER BY t.created_at DESC
+        LIMIT ${sqlLimit}
+      `;
+      const { rows } = await DB.query(sql, params);
+      let shaped = rows.map(r => shapeRow(r, unit, zigUsd));
+      if (combine === 'deep') shaped = await combineRouterTradesDeep(shaped, unit, windowOpts, zigUsd);
+      else shaped = combineRouterTradesShallow(shaped, unit, zigUsd);
+      if (klass) shaped = applyClassFilterJS(shaped, unit, klass, zigUsd);
+      if (minV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? -Infinity) >= minV);
+      if (maxV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? Infinity) <= maxV);
+
+      const { items, total, pages, page: p } = paginateArray(shaped, page, limit);
+      return res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
+    }
+
+    // DB-side worth/class/pagination (stable totals)
+    const params = [];
+    const { sql, params: p2, zigUsdIdx } = buildWorthPagedSQL({
       scope: 'all',
-      includeLiquidity,
+      scopeValue: null,
       direction: dir,
-      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      sqlLimit, sqlOffset: 0
+      includeLiquidity,
+      windowOpts,
+      page, limit,
+      unit, klass,
+      minValue: minV, maxValue: maxV,
+      extraWhere: [] // none
+    }, params);
+    p2[zigUsdIdx - 1] = zigUsd;
+
+    const { rows } = await DB.query(sql, p2);
+    const total = rows[0]?.total ? Number(rows[0].total) : 0;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const shaped = rows.map(r => {
+      const s = shapeRow(r, unit, zigUsd);
+      const w = worthForClass(s, unit, zigUsd);
+      s.class = w != null ? classifyByThreshold(w) : null;
+      return s;
     });
 
-    const { rows } = await DB.query(sql, params);
-    let data = rows.map(r => shapeRow(r, unit, zigUsd));
-
-    if (combine) data = combineRouterTrades(data, unit);
-
-    const klass = String(req.query.class || '').toLowerCase();
-    if (klass) data = applyClassFilter(data, unit, klass);
-
-    const { items, total, pages, page: p } = paginate(data, page, limit);
-    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
+    res.json({ success:true, data: shaped, meta:{ unit, tf:req.query.tf || '24h', limit, page, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
@@ -401,31 +522,74 @@ router.get('/token/:id', async (req, res) => {
     const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
-    const combine = req.query.combineRouter === '1';
+    const combine = String(req.query.combineRouter || '').toLowerCase();
+    const klass  = String(req.query.class || '').toLowerCase();
+    const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
+    const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
 
     const zigUsd = await getZigUsd();
+    const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
 
-    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
+    if (combine === 'deep' || combine === '1' || combine === 'true') {
+      const sqlLimit = Math.min(limit * 20, 20000);
+      const params = [];
+      const where = buildWhereBase({ scope:'token', scopeValue: tok.token_id, direction:dir, includeLiquidity }, params, 't');
+      const { clause } = buildWindow(windowOpts, params, 't');
+      where.push(clause);
 
-    const { sql, params } = buildTradesQuery({
+      const sql = `
+        SELECT
+          t.*,
+          p.pair_contract,
+          p.is_uzig_quote,
+          q.exponent AS qexp,
+          b.exponent AS bexp,
+          b.denom    AS base_denom,
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER AT DESC LIMIT 1) AS pq_price_in_zig,
+          toff.exponent AS offer_exp,
+          task.exponent AS ask_exp
+        ${tradesFromJoin('t')}
+        WHERE ${where.join(' AND ')}
+        ORDER BY t.created_at DESC
+        LIMIT ${sqlLimit}
+      `;
+      const { rows } = await DB.query(sql, params);
+      let shaped = rows.map(r => shapeRow(r, unit, zigUsd));
+      if (combine === 'deep') shaped = await combineRouterTradesDeep(shaped, unit, windowOpts, zigUsd);
+      else shaped = combineRouterTradesShallow(shaped, unit, zigUsd);
+      if (klass) shaped = applyClassFilterJS(shaped, unit, klass, zigUsd);
+      if (minV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? -Infinity) >= minV);
+      if (maxV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? Infinity) <= maxV);
+
+      const { items, total, pages, page: p } = paginateArray(shaped, page, limit);
+      return res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
+    }
+
+    const params = [];
+    const { sql, params: p2, zigUsdIdx } = buildWorthPagedSQL({
       scope: 'token',
-      scopeValue: tok.token_id,  // BIGINT
-      includeLiquidity,
+      scopeValue: tok.token_id,
       direction: dir,
-      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      sqlLimit, sqlOffset: 0
+      includeLiquidity,
+      windowOpts,
+      page, limit,
+      unit, klass,
+      minValue: minV, maxValue: maxV,
+      extraWhere: []
+    }, params);
+    p2[zigUsdIdx - 1] = zigUsd;
+
+    const { rows } = await DB.query(sql, p2);
+    const total = rows[0]?.total ? Number(rows[0].total) : 0;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const shaped = rows.map(r => {
+      const s = shapeRow(r, unit, zigUsd);
+      const w = worthForClass(s, unit, zigUsd);
+      s.class = w != null ? classifyByThreshold(w) : null;
+      return s;
     });
 
-    const { rows } = await DB.query(sql, params);
-    let data = rows.map(r => shapeRow(r, unit, zigUsd));
-
-    if (combine) data = combineRouterTrades(data, unit);
-
-    const klass = String(req.query.class || '').toLowerCase();
-    if (klass) data = applyClassFilter(data, unit, klass);
-
-    const { items, total, pages, page: p } = paginate(data, page, limit);
-    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
+    res.json({ success:true, data: shaped, meta:{ unit, tf:req.query.tf || '24h', limit, page, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
@@ -447,39 +611,80 @@ router.get('/pool/:ref', async (req, res) => {
     const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
-    const combine = req.query.combineRouter === '1';
+    const combine = String(req.query.combineRouter || '').toLowerCase();
+    const klass  = String(req.query.class || '').toLowerCase();
+    const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
+    const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
 
     const zigUsd = await getZigUsd();
+    const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
 
-    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
+    if (combine === 'deep' || combine === '1' || combine === 'true') {
+      const sqlLimit = Math.min(limit * 20, 20000);
+      const params = [];
+      const where = buildWhereBase({ scope:'pool', scopeValue: { poolId }, direction:dir, includeLiquidity }, params, 't');
+      const { clause } = buildWindow(windowOpts, params, 't');
+      where.push(clause);
 
-    const { sql, params } = buildTradesQuery({
+      const sql = `
+        SELECT
+          t.*,
+          p.pair_contract,
+          p.is_uzig_quote,
+          q.exponent AS qexp,
+          b.exponent AS bexp,
+          b.denom    AS base_denom,
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+          toff.exponent AS offer_exp,
+          task.exponent AS ask_exp
+        ${tradesFromJoin('t')}
+        WHERE ${where.join(' AND ')}
+        ORDER BY t.created_at DESC
+        LIMIT ${sqlLimit}
+      `;
+      const { rows } = await DB.query(sql, params);
+      let shaped = rows.map(r => shapeRow(r, unit, zigUsd));
+      if (combine === 'deep') shaped = await combineRouterTradesDeep(shaped, unit, windowOpts, zigUsd);
+      else shaped = combineRouterTradesShallow(shaped, unit, zigUsd);
+      if (klass) shaped = applyClassFilterJS(shaped, unit, klass, zigUsd);
+      if (minV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? -Infinity) >= minV);
+      if (maxV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? Infinity) <= maxV);
+
+      const { items, total, pages, page: p } = paginateArray(shaped, page, limit);
+      return res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
+    }
+
+    const params = [];
+    const { sql, params: p2, zigUsdIdx } = buildWorthPagedSQL({
       scope: 'pool',
       scopeValue: { poolId },
-      includeLiquidity,
       direction: dir,
-      windowOpts: { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      sqlLimit, sqlOffset: 0
+      includeLiquidity,
+      windowOpts,
+      page, limit,
+      unit, klass,
+      minValue: minV, maxValue: maxV,
+      extraWhere: []
+    }, params);
+    p2[zigUsdIdx - 1] = zigUsd;
+
+    const { rows } = await DB.query(sql, p2);
+    const total = rows[0]?.total ? Number(rows[0].total) : 0;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const shaped = rows.map(r => {
+      const s = shapeRow(r, unit, zigUsd);
+      const w = worthForClass(s, unit, zigUsd);
+      s.class = w != null ? classifyByThreshold(w) : null;
+      return s;
     });
 
-    const { rows } = await DB.query(sql, params);
-    let data = rows.map(r => shapeRow(r, unit, zigUsd));
-
-    if (combine) data = combineRouterTrades(data, unit);
-
-    const klass = String(req.query.class || '').toLowerCase();
-    if (klass) data = applyClassFilter(data, unit, klass);
-
-    const { items, total, pages, page: p } = paginate(data, page, limit);
-    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
+    res.json({ success:true, data: shaped, meta:{ unit, tf:req.query.tf || '24h', limit, page, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
-/** GET /trades/wallet/:address
- *  New pagination: page/limit. Optional: class=, combineRouter=1
- */
+/** GET /trades/wallet/:address */
 router.get('/wallet/:address', async (req, res) => {
   try {
     const address = req.params.address;
@@ -488,137 +693,217 @@ router.get('/wallet/:address', async (req, res) => {
     const limit   = parseLimit(req.query.limit);
     const dir     = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
-    const combine = req.query.combineRouter === '1';
+    const combine = String(req.query.combineRouter || '').toLowerCase();
+    const klass  = String(req.query.class || '').toLowerCase();
+    const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
+    const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
 
     const zigUsd = await getZigUsd();
+    const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
 
-    // WHERE + params (no duplicate joins)
-    const where = [];
-    const params = [];
+    if (combine === 'deep' || combine === '1' || combine === 'true') {
+      const sqlLimit = Math.min(limit * 20, 20000);
+      const params = [];
+      const where = buildWhereBase({ scope:'wallet', scopeValue: address, direction:dir, includeLiquidity }, params, 't');
+      const { clause } = buildWindow(windowOpts, params, 't');
+      where.push(clause);
 
-    where.push(`t.signer = $${params.length + 1}`);
-    params.push(address);
+      if (req.query.tokenId) {
+        const tok = await resolveTokenId(req.query.tokenId);
+        if (tok) { where.push(`b.token_id = $${params.length + 1}`); params.push(tok.token_id); }
+      }
+      if (req.query.pair) { where.push(`p.pair_contract = $${params.length + 1}`); params.push(String(req.query.pair)); }
+      else if (req.query.poolId) { where.push(`p.pool_id = $${params.length + 1}`); params.push(String(req.query.poolId)); }
 
-    if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
-    else where.push(`t.action = 'swap'`);
+      const sql = `
+        SELECT
+          t.*,
+          p.pair_contract,
+          p.is_uzig_quote,
+          q.exponent AS qexp,
+          b.exponent AS bexp,
+          b.denom    AS base_denom,
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+          toff.exponent AS offer_exp,
+          task.exponent AS ask_exp
+        ${tradesFromJoin('t')}
+        WHERE ${where.join(' AND ')}
+        ORDER BY t.created_at DESC
+        LIMIT ${sqlLimit}
+      `;
+      const { rows } = await DB.query(sql, params);
+      let shaped = rows.map(r => shapeRow(r, unit, zigUsd));
+      if (combine === 'deep') shaped = await combineRouterTradesDeep(shaped, unit, windowOpts, zigUsd);
+      else shaped = combineRouterTradesShallow(shaped, unit, zigUsd);
+      if (klass) shaped = applyClassFilterJS(shaped, unit, klass, zigUsd);
+      if (minV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? -Infinity) >= minV);
+      if (maxV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? Infinity) <= maxV);
 
-    if (dir) {
-      where.push(`t.direction = $${params.length + 1}`);
-      params.push(dir);
+      const { items, total, pages, page: p } = paginateArray(shaped, page, limit);
+      return res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
     }
 
-    const { clause: timeClause } = buildWindow(
-      { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      params
-    );
-    where.push(timeClause);
-
-    // optional scoping by token / pair / pool (use alias b already present in SELECT)
+    // DB-side pagination path for wallet with optional extra scope
+    const extraWhere = [];
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
-      if (tok) {
-        where.push(`b.token_id = $${params.length + 1}`);
-        params.push(tok.token_id);
-      }
+      if (tok) extraWhere.push(`b.token_id = ${tok.token_id}`);
     }
-
     if (req.query.pair) {
-      where.push(`p.pair_contract = $${params.length + 1}`);
-      params.push(String(req.query.pair));
+      extraWhere.push(`p.pair_contract = '${String(req.query.pair).replace(/'/g,"''")}'`);
     } else if (req.query.poolId) {
-      where.push(`p.pool_id = $${params.length + 1}`);
-      params.push(String(req.query.poolId));
+      extraWhere.push(`p.pool_id = ${Number(req.query.poolId)}`);
     }
 
-    const sqlLimit = computeSqlFetchLimit(page, limit, 5000);
+    const params = [];
+    const { sql, params: p2, zigUsdIdx } = buildWorthPagedSQL({
+      scope: 'wallet',
+      scopeValue: address,
+      direction: dir,
+      includeLiquidity,
+      windowOpts,
+      page, limit,
+      unit, klass,
+      minValue: minV, maxValue: maxV,
+      extraWhere
+    }, params);
+    p2[zigUsdIdx - 1] = zigUsd;
 
-    const sql = `
-      SELECT
-        t.*,
-        p.pair_contract,
-        p.is_uzig_quote,
-        q.exponent AS qexp,
-        b.exponent AS bexp,
-        b.denom    AS base_denom,
-        (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
-        toff.exponent AS offer_exp,
-        task.exponent AS ask_exp
-      FROM trades t
-      JOIN pools  p ON p.pool_id = t.pool_id
-      JOIN tokens q ON q.token_id = p.quote_token_id
-      JOIN tokens b ON b.token_id = p.base_token_id
-      LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
-      LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
-      WHERE ${where.join(' AND ')}
-      ORDER BY t.created_at DESC
-      LIMIT ${sqlLimit}
-    `;
+    const { rows } = await DB.query(sql, p2);
+    const total = rows[0]?.total ? Number(rows[0].total) : 0;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const shaped = rows.map(r => {
+      const s = shapeRow(r, unit, zigUsd);
+      const w = worthForClass(s, unit, zigUsd);
+      s.class = w != null ? classifyByThreshold(w) : null;
+      return s;
+    });
 
-    const { rows } = await DB.query(sql, params);
-    let data = rows.map(r => shapeRow(r, unit, zigUsd));
-
-    if (combine) data = combineRouterTrades(data, unit);
-
-    const klass = String(req.query.class || '').toLowerCase();
-    if (klass) data = applyClassFilter(data, unit, klass);
-
-    const { items, total, pages, page: p } = paginate(data, page, limit);
-    res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf || '24h', limit, page: p, pages, total } });
+    res.json({ success:true, data: shaped, meta:{ unit, tf:req.query.tf || '24h', limit, page, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
-/** GET /trades/large
- *  Now supports: class=shrimp|shark|whale and page/limit
- */
+/** GET /trades/large — DB-side paged worth/class (combine optional) */
 router.get('/large', async (req, res) => {
   try {
     const bucket = (req.query.bucket || '24h').toLowerCase();
     const unit   = (req.query.unit || 'zig').toLowerCase();
     const page   = parsePage(req.query.page);
     const limit  = parseLimit(req.query.limit);
+    const dir    = normDir(req.query.direction);
+    const klass  = String(req.query.class || '').toLowerCase();
+    const combine = String(req.query.combineRouter || '').toLowerCase();
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
-    const klass  = String(req.query.class || '').toLowerCase();
+
     const zigUsd = await getZigUsd();
 
-    const { rows } = await DB.query(`
-      SELECT DISTINCT ON (tx_hash, pool_id, direction)
-             lt.pool_id, lt.tx_hash, lt.signer, lt.direction, lt.value_zig, lt.created_at,
-             p.pair_contract
-      FROM large_trades lt
-      JOIN pools p ON p.pool_id=lt.pool_id
-      WHERE lt.bucket=$1
-      ORDER BY lt.tx_hash, lt.pool_id, lt.direction, lt.created_at DESC
-      LIMIT 2000
-    `, [bucket]);
+    const params = [bucket];
+    let dirClause = '';
+    if (dir) { params.push(dir); dirClause = `AND lt.direction = $${params.length}`; }
 
-    let data = rows.map(r => ({
-      pairContract: r.pair_contract,
-      txHash: r.tx_hash,
-      signer: r.signer,
-      direction: r.direction,
-      valueNative: Number(r.value_zig),
-      valueUsd: Number(r.value_zig) * zigUsd,
-      createdAt: r.created_at,
-      class: classifyByWorth(unit === 'usd' ? (Number(r.value_zig) * zigUsd) : Number(r.value_zig))
-    }));
+    const offset = (page - 1) * limit;
+    const zigUsdIdx = params.length + 1;
+    params.push(zigUsd);
 
-    if (minV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) >= minV);
-    if (maxV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) <= maxV);
-    if (klass) data = data.filter(x => x.class === klass);
+    const worthZig = `
+      COALESCE(
+        CASE WHEN t.offer_asset_denom='uzig'
+             THEN t.offer_amount_base / POWER(10, COALESCE(toff.exponent,6))
+             WHEN t.ask_asset_denom='uzig'
+             THEN t.ask_amount_base   / POWER(10, COALESCE(task.exponent,6))
+        END,
+        CASE WHEN p.is_uzig_quote THEN
+               CASE WHEN t.direction='buy'
+                    THEN t.offer_amount_base  / POWER(10, COALESCE(q.exponent,6))
+                    ELSE t.return_amount_base / POWER(10, COALESCE(q.exponent,6))
+               END
+             ELSE
+               (CASE WHEN t.direction='buy'
+                     THEN t.offer_amount_base  / POWER(10, COALESCE(q.exponent,6))
+                     ELSE t.return_amount_base / POWER(10, COALESCE(q.exponent,6))
+                END) * (SELECT price_in_zig FROM prices WHERE token_id=p.quote_token_id ORDER BY updated_at DESC LIMIT 1)
+        END
+      )
+    `;
+    const worthUsd = `(${worthZig}) * $${zigUsdIdx}`;
 
-    const { items, total, pages, page: p } = paginate(data, page, limit);
-    res.json({ success:true, data: items, meta:{ bucket, unit, limit, page: p, pages, total, minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
+    const filters = [];
+    if (VALID_CLASS.has(klass)) {
+      if (klass === 'shrimp') filters.push(unit === 'zig' ? `${worthZig} < 1000` : `${worthUsd} < 1000`);
+      if (klass === 'shark')  filters.push(unit === 'zig' ? `${worthZig} >= 1000 AND ${worthZig} <= 10000` : `${worthUsd} >= 1000 AND ${worthUsd} <= 10000`);
+      if (klass === 'whale')  filters.push(unit === 'zig' ? `${worthZig} > 10000` : `${worthUsd} > 10000`);
+    }
+    if (minV != null) filters.push(unit === 'zig' ? `${worthZig} >= ${Number(minV)}` : `${worthUsd} >= ${Number(minV)}`);
+    if (maxV != null) filters.push(unit === 'zig' ? `${worthZig} <= ${Number(maxV)}` : `${worthUsd} <= ${Number(maxV)}`);
+
+    const sql = `
+      WITH pick AS (
+        SELECT DISTINCT ON (lt.tx_hash, lt.pool_id, lt.direction)
+               lt.tx_hash, lt.pool_id, lt.direction, lt.value_zig, lt.created_at
+        FROM large_trades lt
+        WHERE lt.bucket = $1 ${dir ? dirClause : ''}
+        ORDER BY lt.tx_hash, lt.pool_id, lt.direction, lt.created_at DESC
+      ),
+      base AS (
+        SELECT
+          t.*,
+          p.pair_contract,
+          p.is_uzig_quote,
+          q.exponent AS qexp,
+          b.exponent AS bexp,
+          b.denom    AS base_denom,
+          toff.exponent AS offer_exp,
+          task.exponent AS ask_exp,
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig
+        FROM trades t
+        JOIN pick k ON k.tx_hash = t.tx_hash AND k.pool_id = t.pool_id AND k.direction = t.direction
+        JOIN pools  p ON p.pool_id = t.pool_id
+        JOIN tokens q ON q.token_id = p.quote_token_id
+        JOIN tokens b ON b.token_id = p.base_token_id
+        LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
+        LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
+      ),
+      ranked AS (
+        SELECT base.*, ${worthZig.replaceAll('t.', 'base.').replaceAll('p.', 'p').replaceAll('q.', 'q') } AS worth_zig,
+               (${worthZig.replaceAll('t.', 'base.').replaceAll('p.', 'p').replaceAll('q.', 'q')}) * $${zigUsdIdx} AS worth_usd,
+               COUNT(*) OVER() AS total
+        FROM base
+        JOIN pools p ON p.pool_id = base.pool_id
+        JOIN tokens q ON q.token_id = p.quote_token_id
+        ${filters.length ? `WHERE ${filters.map(f => f.replaceAll('t.', 'base.')).join(' AND ')}` : ''}
+        ORDER BY base.created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      )
+      SELECT * FROM ranked
+    `;
+
+    const { rows } = await DB.query(sql, params);
+
+    let shaped = rows.map(r => shapeRow(r, unit, zigUsd));
+    if (combine === 'deep' || combine === '1' || combine === 'true') {
+      const windowOpts = { tf: bucket };
+      if (combine === 'deep') shaped = await combineRouterTradesDeep(shaped, unit, windowOpts, zigUsd);
+      else shaped = combineRouterTradesShallow(shaped, unit, zigUsd);
+    }
+    const total = rows[0]?.total ? Number(rows[0].total) : shaped.length;
+    const pages = Math.max(1, Math.ceil(total / limit));
+
+    shaped = shaped.map(s => {
+      const w = worthForClass(s, unit, zigUsd);
+      s.class = w != null ? classifyByThreshold(w) : null;
+      return s;
+    });
+
+    res.json({ success:true, data: shaped, meta:{ unit, tf: bucket, limit, page, pages, total } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
-/** GET /trades/recent
- *  Now supports: class=shrimp|shark|whale, combineRouter=1, and page/limit
- */
+/** GET /trades/recent — DB-side worth/class paging by default (stable totals) */
 router.get('/recent', async (req, res) => {
   try {
     const unit   = String(req.query.unit || 'usd').toLowerCase();
@@ -626,80 +911,93 @@ router.get('/recent', async (req, res) => {
     const limit  = parseLimit(req.query.limit);
     const dir    = normDir(req.query.direction);
     const includeLiquidity = req.query.includeLiquidity === '1';
+    const combine = String(req.query.combineRouter || '').toLowerCase();
+    const klass  = String(req.query.class || '').toLowerCase();
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
-    const klass  = String(req.query.class || '').toLowerCase();
-    const combine = req.query.combineRouter === '1';
 
     const zigUsd = await getZigUsd();
+    const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
 
-    const where = [];
-    const params = [];
+    if (combine === 'deep' || combine === '1' || combine === 'true') {
+      const sqlLimit = Math.min(limit * 20, 20000);
+      const params = [];
+      const where = buildWhereBase({ scope:'all', scopeValue:null, direction:dir, includeLiquidity }, params, 't');
+      const { clause } = buildWindow(windowOpts, params, 't');
+      where.push(clause);
 
-    if (includeLiquidity) where.push(`t.action IN ('swap','provide','withdraw')`);
-    else where.push(`t.action = 'swap'`);
+      if (req.query.tokenId) {
+        const tok = await resolveTokenId(req.query.tokenId);
+        if (tok) { where.push(`b.token_id = $${params.length + 1}`); params.push(tok.token_id); }
+      }
+      if (req.query.pair) { where.push(`p.pair_contract = $${params.length + 1}`); params.push(String(req.query.pair)); }
+      else if (req.query.poolId) { where.push(`p.pool_id = $${params.length + 1}`); params.push(String(req.query.poolId)); }
 
-    if (dir) {
-      where.push(`t.direction = $${params.length + 1}`);
-      params.push(dir);
+      const sql = `
+        SELECT
+          t.*,
+          p.pair_contract,
+          p.is_uzig_quote,
+          q.exponent AS qexp,
+          b.exponent AS bexp,
+          b.denom    AS base_denom,
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
+          toff.exponent AS offer_exp,
+          task.exponent AS ask_exp
+        ${tradesFromJoin('t')}
+        WHERE ${where.join(' AND ')}
+        ORDER BY t.created_at DESC
+        LIMIT ${sqlLimit}
+      `;
+      const { rows } = await DB.query(sql, params);
+      let shaped = rows.map(r => shapeRow(r, unit, zigUsd));
+      if (combine === 'deep') shaped = await combineRouterTradesDeep(shaped, unit, windowOpts, zigUsd);
+      else shaped = combineRouterTradesShallow(shaped, unit, zigUsd);
+      if (klass) shaped = applyClassFilterJS(shaped, unit, klass, zigUsd);
+      if (minV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? -Infinity) >= minV);
+      if (maxV != null) shaped = shaped.filter(x => (worthForClass(x, unit, zigUsd) ?? Infinity) <= maxV);
+
+      const { items, total, pages, page: p } = paginateArray(shaped, page, limit);
+      return res.json({ success:true, data: items, meta:{ unit, limit, page: p, pages, total, tf: req.query.tf || '24h', minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
     }
 
-    const { clause: timeClause } = buildWindow(
-      { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days },
-      params
-    );
-    where.push(timeClause);
-
-    // optional scope: token / pair / pool (use alias b already present in SELECT)
+    // DB-side (stable totals) — reuse buildWorthPagedSQL with optional token/pair/pool scope
+    const extraWhere = [];
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
-      if (tok) {
-        where.push(`b.token_id = $${params.length + 1}`);
-        params.push(tok.token_id);
-      }
+      if (tok) extraWhere.push(`b.token_id = ${tok.token_id}`);
     }
     if (req.query.pair) {
-      where.push(`p.pair_contract = $${params.length + 1}`);
-      params.push(String(req.query.pair));
+      extraWhere.push(`p.pair_contract = '${String(req.query.pair).replace(/'/g,"''")}'`);
     } else if (req.query.poolId) {
-      where.push(`p.pool_id = $${params.length + 1}`);
-      params.push(String(req.query.poolId));
+      extraWhere.push(`p.pool_id = ${Number(req.query.poolId)}`);
     }
 
-    const sqlLimit = computeSqlFetchLimit(page, limit, 2000);
+    const params = [];
+    const { sql, params: p2, zigUsdIdx } = buildWorthPagedSQL({
+      scope: 'all',
+      scopeValue: null,
+      direction: dir,
+      includeLiquidity,
+      windowOpts,
+      page, limit,
+      unit, klass,
+      minValue: minV, maxValue: maxV,
+      extraWhere
+    }, params);
+    p2[zigUsdIdx - 1] = zigUsd;
 
-    const sql = `
-      SELECT
-        t.*,
-        p.pair_contract,
-        p.is_uzig_quote,
-        q.exponent AS qexp,
-        b.exponent AS bexp,
-        b.denom    AS base_denom,
-        (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
-        toff.exponent AS offer_exp,
-        task.exponent AS ask_exp
-      FROM trades t
-      JOIN pools  p ON p.pool_id = t.pool_id
-      JOIN tokens q ON q.token_id = p.quote_token_id
-      JOIN tokens b ON b.token_id = p.base_token_id
-      LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
-      LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
-      WHERE ${where.join(' AND ')}
-      ORDER BY t.created_at DESC
-      LIMIT ${sqlLimit}
-    `;
+    const { rows } = await DB.query(sql, p2);
+    const total = rows[0]?.total ? Number(rows[0].total) : 0;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const shaped = rows.map(r => {
+      const s = shapeRow(r, unit, zigUsd);
+      const w = worthForClass(s, unit, zigUsd);
+      s.class = w != null ? classifyByThreshold(w) : null;
+      return s;
+    });
 
-    const { rows } = await DB.query(sql, params);
-    let data = rows.map(r => shapeRow(r, unit, zigUsd));
-
-    if (minV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) >= minV);
-    if (maxV != null) data = data.filter(x => (unit === 'usd' ? x.valueUsd : x.valueNative) <= maxV);
-    if (combine) data = combineRouterTrades(data, unit);
-    if (klass) data = applyClassFilter(data, unit, klass);
-
-    const { items, total, pages, page: p } = paginate(data, page, limit);
-    res.json({ success:true, data: items, meta:{ unit, limit, page: p, pages, total, tf: req.query.tf || '24h', minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
+    res.json({ success:true, data: shaped, meta:{ unit, limit, page, pages, total, tf: req.query.tf || '24h', minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
