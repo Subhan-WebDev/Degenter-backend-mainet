@@ -2,6 +2,7 @@
 import express from 'express';
 import { DB } from '../../lib/db.js';
 import { resolveTokenId, getZigUsd } from '../util/resolve-token.js';
+// keep legacy utilities for optional paths
 import { resolvePoolSelection, changePctForMinutes } from '../util/pool-select.js';
 import { getCandles, ensureTf } from '../util/ohlcv-agg.js';
 import e from 'express';
@@ -11,16 +12,152 @@ const router = express.Router();
 const toNum = x => (x == null ? null : Number(x));
 const disp = (base, exp) => (base == null ? null : Number(base) / (10 ** (exp || 0)));
 
-/* =======================================================================
-   GET /tokens  (pagination + images + cumulative metrics)
-   ======================================================================= */
+/* ───────────────────────── helpers FROM /swap ───────────────────────── */
+
+// Oroswap pair type → taker fee fraction (same as /swap)
+function pairFee(pairType) {
+  if (!pairType) return 0.003;
+  const t = String(pairType).toLowerCase();
+  if (t === 'xyk') return 0.0001;
+  if (t === 'concentrated') return 0.01;
+  const m = t.match(/xyk[_-](\d+)/);
+  if (m) {
+    const bps = Number(m[1]);
+    if (Number.isFinite(bps)) return bps / 10_000;
+  }
+  return 0.003;
+}
+
+/** XYK simulation (fee-on-input). Rz = zig reserve, Rt = token reserve. (same as /swap) */
+function simulateXYK({ fromIsZig, amountIn, Rz, Rt, fee }) {
+  if (!(Rz > 0 && Rt > 0) || !(amountIn > 0)) {
+    return { out: 0, price: 0, impact: 0 };
+  }
+  const mid = Rz / Rt; // zig per token
+  const xin = amountIn * (1 - fee);
+
+  if (fromIsZig) {
+    // ZIG -> Token
+    const outToken = (xin * Rt) / (Rz + xin);
+    const effZigPerToken = amountIn / Math.max(outToken, 1e-18);
+    const impact = mid > 0 ? (effZigPerToken / mid) - 1 : 0;
+    return { out: outToken, price: effZigPerToken, impact };
+  } else {
+    // Token -> ZIG
+    const outZig = (xin * Rz) / (Rt + xin);
+    const effZigPerToken = outZig / amountIn; // executable zig per 1 token
+    const impact = mid > 0 ? (mid / Math.max(effZigPerToken, 1e-18)) - 1 : 0;
+    return { out: outZig, price: effZigPerToken, impact };
+  }
+}
+
+/** Load all UZIG-quoted pools for a token, including mid price & reserves (display units). (same as /swap) */
+async function loadUzigPoolsForToken(tokenId, { minTvlZig = 0 } = {}) {
+  const { rows } = await DB.query(
+    `
+    SELECT
+      p.pool_id,
+      p.pair_contract,
+      p.pair_type,
+      pr.price_in_zig,           -- mid zig per token
+      ps.reserve_base_base   AS res_base_base,
+      ps.reserve_quote_base  AS res_quote_base,
+      tb.exponent            AS base_exp,
+      tq.exponent            AS quote_exp,
+      COALESCE(pm.tvl_zig,0) AS tvl_zig
+    FROM pools p
+    JOIN tokens tb           ON tb.token_id = p.base_token_id
+    JOIN tokens tq           ON tq.token_id = p.quote_token_id
+    LEFT JOIN pool_state ps  ON ps.pool_id = p.pool_id
+    LEFT JOIN pool_matrix pm ON pm.pool_id = p.pool_id AND pm.bucket = '24h'
+    LEFT JOIN LATERAL (
+      SELECT price_in_zig
+        FROM prices
+       WHERE pool_id = p.pool_id
+         AND token_id = p.base_token_id
+       ORDER BY updated_at DESC
+       LIMIT 1
+    ) pr ON TRUE
+    WHERE p.is_uzig_quote = TRUE
+      AND p.base_token_id = $1
+    `,
+    [tokenId]
+  );
+
+  return rows
+    .map(r => {
+      const Rt = Number(r.res_base_base  || 0) / Math.pow(10, Number(r.base_exp  || 0)); // token reserve
+      const Rz = Number(r.res_quote_base || 0) / Math.pow(10, Number(r.quote_exp || 0)); // zig reserve
+      return {
+        poolId:       String(r.pool_id),
+        pairContract: r.pair_contract,
+        pairType:     r.pair_type,
+        priceInZig:   Number(r.price_in_zig || 0), // **mid** zig per token
+        tokenReserve: Rt,
+        zigReserve:   Rz,
+        tvlZig:       Number(r.tvl_zig || 0),
+      };
+    })
+    .filter(p => p.tvlZig >= minTvlZig);
+}
+
+/** Pick best pool by sim (maximize out). (same as /swap) */
+function pickBySimulation(pools, { fromIsZig, amountIn }) {
+  let best = null;
+  for (const p of pools) {
+    const fee = pairFee(p.pairType);
+    const hasRes = p.zigReserve > 0 && p.tokenReserve > 0;
+    const sim = hasRes
+      ? simulateXYK({ fromIsZig, amountIn, Rz: p.zigReserve, Rt: p.tokenReserve, fee })
+      : null;
+    const score = sim ? sim.out : 0;
+    const cand = { ...p, fee, sim, score };
+    if (!best || cand.score > best.score) best = cand;
+  }
+  return best;
+}
+
+/** Default notional (~$100) when amt not provided. (same as /swap) */
+function defaultAmount(side, { zigUsd, pools }) {
+  const targetUsd = 100;
+  const zigAmt = targetUsd / Math.max(zigUsd, 1e-9);
+  if (side === 'buy') return zigAmt; // from ZIG
+  const avgMid = pools.length
+    ? pools.reduce((s, p) => s + (p.priceInZig || 0), 0) / pools.length
+    : 1;
+  return zigAmt / Math.max(avgMid, 1e-12); // from token
+}
+
+/** best pool for ZIG→TOKEN (buy) and TOKEN→ZIG (sell) — identical to /swap **/
+async function bestBuyPool(tokenId, { amountIn, minTvlZig, zigUsd }) {
+  const pools = await loadUzigPoolsForToken(tokenId, { minTvlZig });
+  if (!pools.length) return null;
+  const amt = Number.isFinite(amountIn) ? Number(amountIn) : defaultAmount('buy', { zigUsd, pools });
+  const pick = pickBySimulation(pools, { fromIsZig: true, amountIn: amt });
+  if (!pick) return null;
+  return { ...pick, amtUsed: amt };
+}
+
+async function bestSellPool(tokenId, { amountIn, minTvlZig, zigUsd }) {
+  const pools = await loadUzigPoolsForToken(tokenId, { minTvlZig });
+  if (!pools.length) return null;
+  const amt = Number.isFinite(amountIn) ? Number(amountIn) : defaultAmount('sell', { zigUsd, pools });
+  const pick = pickBySimulation(pools, { fromIsZig: false, amountIn: amt });
+  if (!pick) return null;
+  return { ...pick, amtUsed: amt };
+}
+
+/* ================================ LIST: GET /tokens ================================ */
+/* Now uses bestSellPool() for change% pool selection. Optional includeBest=1 returns the chosen pool. */
 router.get('/', async (req, res) => {
   try {
     const bucket = (req.query.bucket || '24h').toLowerCase();
-    const priceSource = (req.query.priceSource || 'best').toLowerCase();
     const sort = (req.query.sort || 'mcap').toLowerCase();
     const dir  = (req.query.dir || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
     const includeChange = req.query.includeChange === '1';
+    const includeBest   = req.query.includeBest === '1';
+    const minTvlZigBest = Number(req.query.minBestTvl || '0');
+    const amtParam      = req.query.amt ? Number(req.query.amt) : undefined; // optional sizing to mirror /swap
     const limit  = Math.max(1, Math.min(parseInt(req.query.limit || '50', 10), 200));
     const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
     const zigUsd = await getZigUsd();
@@ -58,18 +195,25 @@ router.get('/', async (req, res) => {
       LIMIT $2 OFFSET $3
     `, [bucket, limit, offset]);
 
-    // optional 24h change using selected priceSource
+    // compute best pool per row (used for change%, and optionally returned)
+    const bestMap = new Map();
+    if ((includeChange || includeBest) && rows.rows.length) {
+      const picks = await Promise.all(rows.rows.map(async r => {
+        const pick = await bestSellPool(r.token_id, { amountIn: amtParam, minTvlZig: minTvlZigBest, zigUsd });
+        return { id: r.token_id, pick };
+      }));
+      for (const x of picks) bestMap.set(String(x.id), x.pick);
+    }
+
+    // optional change% from best pool (sell leg)
     const changeMap = new Map();
     if (includeChange && rows.rows.length) {
-      const pairs = await Promise.all(rows.rows.map(async r => {
-        const sel = await resolvePoolSelection(r.token_id, { priceSource });
-        return { id: r.token_id, poolId: sel.pool?.pool_id || null };
+      await Promise.all(rows.rows.map(async r => {
+        const pick = bestMap.get(String(r.token_id));
+        if (!pick?.poolId) { changeMap.set(String(r.token_id), null); return; }
+        const pct = await changePctForMinutes(pick.poolId, 1440);
+        changeMap.set(String(r.token_id), pct);
       }));
-      for (const x of pairs) {
-        if (!x.poolId) continue;
-        const pct = await changePctForMinutes(x.poolId, 1440);
-        changeMap.set(String(x.id), pct);
-      }
     }
 
     const data = rows.rows.map(r => {
@@ -77,7 +221,8 @@ router.get('/', async (req, res) => {
       const mcapN  = toNum(r.mcap_zig);
       const fdvN   = toNum(r.fdv_zig);
       const volN   = toNum(r.vol_zig) || 0;
-      return {
+
+      const base = {
         tokenId: r.token_id,
         denom: r.denom,
         symbol: r.symbol,
@@ -96,31 +241,42 @@ router.get('/', async (req, res) => {
         tx: toNum(r.tx) || 0,
         ...(includeChange ? { change24hPct: changeMap.get(String(r.token_id)) ?? null } : {})
       };
+
+      if (includeBest) {
+        const bp = bestMap.get(String(r.token_id)) || null;
+        base.bestPool = bp ? {
+          poolId: bp.poolId,
+          pairContract: bp.pairContract,
+          pairType: bp.pairType,
+          fee: bp.fee,
+          priceNativeMid: bp.priceInZig,
+          tvlNative: bp.tvlZig,
+          reserves: { zig: bp.zigReserve, token: bp.tokenReserve },
+          sim: bp.sim || null,
+          amtUsed: bp.amtUsed
+        } : null;
+      }
+      return base;
     });
 
     const total = rows.rows[0]?.total ?? 0;
-    res.json({ success: true, data, meta: { bucket, priceSource, sort, dir, limit, offset, total } });
+    res.json({ success: true, data, meta: { bucket, sort, dir, limit, offset, total, includeBest: includeBest ? 1 : 0 } });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
-/* =======================================================================
-   GET /tokens/gainers  &  /tokens/losers
-   - Ranks by 24h price change (%), computed from selected priceSource pool
-   - Query: bucket=24h|1h|... (affects volume fields only), priceSource=best|uzig|pool
-            limit<=200 (default 100), offset (default 0)
-   ======================================================================= */
-
+/* ============================ GAINERS / LOSERS ============================ */
+/* Now change% computed from bestSellPool() like /swap selects a pool. */
 router.get('/gainers', async (req, res) => {
   try {
     const bucket = (req.query.bucket || '24h').toLowerCase();
-    const priceSource = (req.query.priceSource || 'best').toLowerCase();
     const outLimit = Math.max(1, Math.min(parseInt(req.query.limit || '100', 10), 200));
     const outOffset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const minTvlZigBest = Number(req.query.minBestTvl || '0');
+    const amtParam      = req.query.amt ? Number(req.query.amt) : undefined;
     const zigUsd = await getZigUsd();
 
-    // Fetch a broad set first (we’ll sort by change then paginate)
     const FETCH_LIMIT = 1000;
 
     const rows = await DB.query(`
@@ -145,12 +301,11 @@ router.get('/gainers', async (req, res) => {
       LIMIT $2 OFFSET 0
     `, [bucket, FETCH_LIMIT]);
 
-    // compute change24hPct via your pool-selection logic
     const changeMap = new Map();
     await Promise.all(rows.rows.map(async r => {
-      const sel = await resolvePoolSelection(r.token_id, { priceSource });
-      if (!sel?.pool?.pool_id) { changeMap.set(String(r.token_id), null); return; }
-      const pct = await changePctForMinutes(sel.pool.pool_id, 1440);
+      const pick = await bestSellPool(r.token_id, { amountIn: amtParam, minTvlZig: minTvlZigBest, zigUsd });
+      if (!pick?.poolId) { changeMap.set(String(r.token_id), null); return; }
+      const pct = await changePctForMinutes(pick.poolId, 1440);
       changeMap.set(String(r.token_id), pct);
     }));
 
@@ -177,7 +332,6 @@ router.get('/gainers', async (req, res) => {
       };
     });
 
-    // Sort by change desc (gainers), then paginate
     const sorted = data
       .filter(x => x.change24hPct != null)
       .sort((a,b) => b.change24hPct - a.change24hPct);
@@ -188,7 +342,7 @@ router.get('/gainers', async (req, res) => {
     res.json({
       success: true,
       data: pageItems,
-      meta: { board: 'gainers', bucket, priceSource, limit: outLimit, offset: outOffset, total }
+      meta: { board: 'gainers', bucket, limit: outLimit, offset: outOffset, total }
     });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
@@ -198,9 +352,10 @@ router.get('/gainers', async (req, res) => {
 router.get('/losers', async (req, res) => {
   try {
     const bucket = (req.query.bucket || '24h').toLowerCase();
-    const priceSource = (req.query.priceSource || 'best').toLowerCase();
     const outLimit = Math.max(1, Math.min(parseInt(req.query.limit || '100', 10), 200));
     const outOffset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const minTvlZigBest = Number(req.query.minBestTvl || '0');
+    const amtParam      = req.query.amt ? Number(req.query.amt) : undefined;
     const zigUsd = await getZigUsd();
 
     const FETCH_LIMIT = 1000;
@@ -229,9 +384,9 @@ router.get('/losers', async (req, res) => {
 
     const changeMap = new Map();
     await Promise.all(rows.rows.map(async r => {
-      const sel = await resolvePoolSelection(r.token_id, { priceSource });
-      if (!sel?.pool?.pool_id) { changeMap.set(String(r.token_id), null); return; }
-      const pct = await changePctForMinutes(sel.pool.pool_id, 1440);
+      const pick = await bestSellPool(r.token_id, { amountIn: amtParam, minTvlZig: minTvlZigBest, zigUsd });
+      if (!pick?.poolId) { changeMap.set(String(r.token_id), null); return; }
+      const pct = await changePctForMinutes(pick.poolId, 1440);
       changeMap.set(String(r.token_id), pct);
     }));
 
@@ -258,7 +413,6 @@ router.get('/losers', async (req, res) => {
       };
     });
 
-    // Sort by change asc (losers), then paginate
     const sorted = data
       .filter(x => x.change24hPct != null)
       .sort((a,b) => a.change24hPct - b.change24hPct);
@@ -269,22 +423,23 @@ router.get('/losers', async (req, res) => {
     res.json({
       success: true,
       data: pageItems,
-      meta: { board: 'losers', bucket, priceSource, limit: outLimit, offset: outOffset, total }
+      meta: { board: 'losers', bucket, limit: outLimit, offset: outOffset, total }
     });
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
-
-/* =======================================================================
-   GET /tokens/swap-list  (image + hooky stats for dropdown)
-   ======================================================================= */
+/* =========================== SWAP LIST: GET /tokens/swap-list =========================== */
+/* Optional includeBest=1 — returns the same bestSellPool() block used by /swap. */
 router.get('/swap-list', async (req, res) => {
   try {
     const bucket = (req.query.bucket || '24h').toLowerCase();
     const limit  = Math.max(1, Math.min(parseInt(req.query.limit || '200', 10), 500));
     const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const includeBest   = req.query.includeBest === '1';
+    const minTvlZigBest = Number(req.query.minBestTvl || '0');
+    const amtParam      = req.query.amt ? Number(req.query.amt) : undefined;
     const zigUsd = await getZigUsd();
 
     const rows = await DB.query(`
@@ -308,13 +463,24 @@ router.get('/swap-list', async (req, res) => {
       LIMIT $2 OFFSET $3
     `, [bucket, limit, offset]);
 
+    // best pool (sell leg) per token if requested
+    const bestMap = new Map();
+    if (includeBest && rows.rows.length) {
+      const picks = await Promise.all(rows.rows.map(async r => {
+        const pick = await bestSellPool(r.token_id, { amountIn: amtParam, minTvlZig: minTvlZigBest, zigUsd });
+        return { id: r.token_id, pick };
+      }));
+      for (const x of picks) bestMap.set(String(x.id), x.pick);
+    }
+
     const data = rows.rows.map(r => {
       const priceN = toNum(r.price_in_zig);
       const mcapN  = toNum(r.mcap_zig);
       const fdvN   = toNum(r.fdv_zig);
       const volN   = toNum(r.vol_zig) || 0;
       const tvlN   = toNum(r.tvl_zig) || 0;
-      return {
+
+      const base = {
         tokenId: r.token_id,
         symbol: r.symbol,
         exponent:r.exponent,
@@ -333,37 +499,74 @@ router.get('/swap-list', async (req, res) => {
         tvlUsd: tvlN * zigUsd,
         tx: toNum(r.tx) || 0,
       };
+
+      if (includeBest) {
+        const bp = bestMap.get(String(r.token_id)) || null;
+        base.bestPool = bp ? {
+          poolId: bp.poolId,
+          pairContract: bp.pairContract,
+          pairType: bp.pairType,
+          fee: bp.fee,
+          priceNativeMid: bp.priceInZig,
+          tvlNative: bp.tvlZig,
+          reserves: { zig: bp.zigReserve, token: bp.tokenReserve },
+          sim: bp.sim || null,
+          amtUsed: bp.amtUsed
+        } : null;
+      }
+
+      return base;
     });
 
-    res.json({ success: true, data, meta: { bucket, limit, offset }});
+    res.json({ success: true, data, meta: { bucket, limit, offset, includeBest: includeBest ? 1 : 0 }});
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
+/* =============================== TOKEN PAGE: GET /tokens/:id =============================== */
+/* Price & pool now taken from bestSellPool() so it matches /swap (from=token, to=uzig). */
 router.get('/:id', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
     if (!tok) return res.status(404).json({ success:false, error:'token not found' });
 
     const zigUsd = await getZigUsd();
-    const priceSource = (req.query.priceSource || 'best').toLowerCase();
-    const sel = await resolvePoolSelection(tok.token_id, { priceSource, poolId: req.query.poolId });
+    const includeBest   = req.query.includeBest === '1';
+    const minTvlZigBest = Number(req.query.minBestTvl || '0');
+    const amtParam      = req.query.amt ? Number(req.query.amt) : undefined;
 
-    // current native price for selected pool (if any)
-    const pr = sel.pool?.pool_id
-      ? await DB.query(
-          `SELECT price_in_zig 
-             FROM prices 
-            WHERE token_id=$1 AND pool_id=$2 
-         ORDER BY updated_at DESC 
-            LIMIT 1`,
-          [tok.token_id, sel.pool.pool_id]
-        )
-      : { rows: [] };
+    // pick the same pool /swap would use for SELL (token -> uzig)
+    const best = await bestSellPool(tok.token_id, { amountIn: amtParam, minTvlZig: minTvlZigBest, zigUsd });
+
+    // if no pool, return minimal object
+    if (!best?.poolId) {
+      const srow = await DB.query(`SELECT exponent, image_uri, website, twitter, telegram, description FROM tokens WHERE token_id=$1`, [tok.token_id]);
+      const s = srow.rows[0] || {};
+      return res.json({ success: true, data: {
+        tokenId: String(tok.token_id),
+        denom: tok.denom, symbol: tok.symbol, name: tok.name,
+        exponent: s.exponent != null ? Number(s.exponent) : 6,
+        imageUri: s.image_uri, website: s.website, twitter: s.twitter, telegram: s.telegram,
+        description: s.description,
+        price: { source: 'best', poolId: null, native: null, usd: null, changePct: { '30m':0, '1h':0, '4h':0, '24h': null } },
+        liquidity: 0, liquidityNative: 0,
+        ...(includeBest ? { bestPool: null } : {})
+      }});
+    }
+
+    // current mid price from that pool
+    const pr = await DB.query(
+      `SELECT price_in_zig 
+         FROM prices 
+        WHERE token_id=$1 AND pool_id=$2 
+     ORDER BY updated_at DESC 
+        LIMIT 1`,
+      [tok.token_id, best.poolId]
+    );
     const priceNative = pr.rows[0]?.price_in_zig != null ? Number(pr.rows[0].price_in_zig) : null;
 
-    // token static fields
+    // static fields + supply
     const srow = await DB.query(`
       SELECT total_supply_base, max_supply_base, exponent, image_uri, website, twitter, telegram, description
         FROM tokens WHERE token_id=$1
@@ -373,45 +576,37 @@ router.get('/:id', async (req, res) => {
     const circ = disp(s.total_supply_base, exp);
     const max  = disp(s.max_supply_base,   exp);
 
-    // ==== LIVE TVL (sum across this token's UZIG-quoted pools) ===========
-    // TVL_zig(pool) = token_reserve_disp * mid(price_in_zig) + zig_reserve_disp
-    // TVL_usd       = TVL_zig * zigUsd
+    // LIVE TVL sum across UZIG pools
     const live = await DB.query(`
       SELECT
-        p.pool_id,
         ps.reserve_base_base   AS res_base_base,
         ps.reserve_quote_base  AS res_quote_base,
         tb.exponent            AS base_exp,
         tq.exponent            AS quote_exp,
         (
-          SELECT price_in_zig
-            FROM prices pr
-           WHERE pr.pool_id = p.pool_id
-             AND pr.token_id = p.base_token_id
-        ORDER BY pr.updated_at DESC
-           LIMIT 1
+          SELECT price_in_zig FROM prices pr
+           WHERE pr.pool_id = p.pool_id AND pr.token_id = p.base_token_id
+           ORDER BY pr.updated_at DESC LIMIT 1
         ) AS price_in_zig
       FROM pools p
       LEFT JOIN pool_state ps   ON ps.pool_id   = p.pool_id
       JOIN tokens tb            ON tb.token_id  = p.base_token_id
       JOIN tokens tq            ON tq.token_id  = p.quote_token_id
-      WHERE p.base_token_id = $1
-        AND p.is_uzig_quote = TRUE
+      WHERE p.base_token_id = $1 AND p.is_uzig_quote = TRUE
     `, [tok.token_id]);
 
     let tvlZigSum = 0;
     for (const r of live.rows) {
-      const Rt = Number(r.res_base_base  || 0) / Math.pow(10, Number(r.base_exp  ?? 0)); // token reserve (display)
-      const Rz = Number(r.res_quote_base || 0) / Math.pow(10, Number(r.quote_exp ?? 0)); // ZIG reserve (display)
-      const midZig = Number(r.price_in_zig || 0); // zig per token
+      const Rt = Number(r.res_base_base  || 0) / Math.pow(10, Number(r.base_exp  ?? 0));
+      const Rz = Number(r.res_quote_base || 0) / Math.pow(10, Number(r.quote_exp ?? 0));
+      const midZig = Number(r.price_in_zig || 0);
       const tvlZigPool = (Rt * midZig) + Rz;
       if (Number.isFinite(tvlZigPool)) tvlZigSum += tvlZigPool;
     }
-    const liquidityNativeZig = tvlZigSum;            // ZIG
-    const liquidityUSD       = liquidityNativeZig * zigUsd; // USD
-    // =====================================================================
+    const liquidityNativeZig = tvlZigSum;
+    const liquidityUSD       = liquidityNativeZig * zigUsd;
 
-    // stats aggregates across all pools (four buckets)
+    // rollups
     const buckets = ['30m','1h','4h','24h'];
     const agg = await DB.query(`
       SELECT pm.bucket,
@@ -448,16 +643,15 @@ router.get('/:id', async (req, res) => {
     const r24 = map.get('24h') || { vbuy:0, vsell:0, tbuy:0, tsell:0, uniq:0, tvl:0 };
 
     const priceChange = {
-      '30m': sel.pool?.pool_id ? await changePctForMinutes(sel.pool.pool_id, 30)   : 0,
-      '1h' : sel.pool?.pool_id ? await changePctForMinutes(sel.pool.pool_id, 60)   : 0,
-      '4h' : sel.pool?.pool_id ? await changePctForMinutes(sel.pool.pool_id, 240)  : 0,
-      '24h': sel.pool?.pool_id ? await changePctForMinutes(sel.pool.pool_id, 1440) : 0,
+      '30m': await changePctForMinutes(best.poolId, 30),
+      '1h' : await changePctForMinutes(best.poolId, 60),
+      '4h' : await changePctForMinutes(best.poolId, 240),
+      '24h': await changePctForMinutes(best.poolId, 1440),
     };
 
     const mcNative  = (priceNative != null && circ != null) ? circ * priceNative : null;
     const fdvNative = (priceNative != null && max  != null) ? max  * priceNative : null;
 
-    // header meta counts
     const poolsCount = (await DB.query(
       `SELECT COUNT(*)::int AS c FROM pools WHERE base_token_id=$1`, [tok.token_id]
     )).rows[0]?.c || 0;
@@ -470,18 +664,28 @@ router.get('/:id', async (req, res) => {
       `SELECT MIN(created_at) AS first_ts FROM pools WHERE base_token_id=$1`, [tok.token_id]
     )).rows[0]?.first_ts || null;
 
-    // socials (twitter block)
     const tw = await DB.query(`
       SELECT handle, user_id, name, is_blue_verified, verified_type, profile_picture, cover_picture,
              followers, following, created_at_twitter, last_refreshed
         FROM token_twitter WHERE token_id=$1
     `, [tok.token_id]);
 
-    // === RESPONSE =========================================================
+    // best pool block (optional echo)
+    const bestBlock = includeBest ? {
+      poolId: best.poolId,
+      pairContract: best.pairContract,
+      pairType: best.pairType,
+      fee: best.fee,
+      priceNativeMid: best.priceInZig,
+      tvlNative: best.tvlZig,
+      reserves: { zig: best.zigReserve, token: best.tokenReserve },
+      sim: best.sim || null,
+      amtUsed: best.amtUsed
+    } : undefined;
+
     res.json({
       success: true,
       data: {
-        // Meta / identity
         tokenId: String(tok.token_id),
         denom: tok.denom,
         symbol: tok.symbol,
@@ -506,10 +710,10 @@ router.get('/:id', async (req, res) => {
           }
         } : {},
 
-        // Compact price object
+        // Price object now tied to /swap best pool (sell leg)
         price: {
-          source: priceSource,
-          poolId: sel.pool?.pool_id ? String(sel.pool.pool_id) : null,
+          source: 'best',
+          poolId: String(best.poolId),
           native: priceNative,
           usd: priceNative != null ? priceNative * zigUsd : null,
           changePct: priceChange
@@ -520,15 +724,15 @@ router.get('/:id', async (req, res) => {
         mcap:   { native: mcNative, usd: mcNative != null ? mcNative * zigUsd : null },
         fdv:    { native: fdvNative, usd: fdvNative != null ? fdvNative * zigUsd : null },
 
-        // ===== Original block (names preserved) =====
+        // Legacy fields (kept as-is but now consistent with best pool)
         priceInNative: priceNative,
         priceInUsd: priceNative != null ? priceNative * zigUsd : null,
-        priceSource: priceSource,
-        poolId: sel.pool?.pool_id ? String(sel.pool.pool_id) : null,
+        priceSource: 'best',
+        poolId: String(best.poolId),
         pools: poolsCount,
         holder: holders,
         creationTime: creation,
-        supply: max ?? circ, // original field
+        supply: max ?? circ, // legacy
         circulatingSupply: circ,
         fdvNative,
         fdv: fdvNative != null ? fdvNative * zigUsd : null,
@@ -549,9 +753,11 @@ router.get('/:id', async (req, res) => {
         vBuyUSD: r24.vbuy * zigUsd,
         vSellUSD: r24.vsell * zigUsd,
 
-        // >>> fixed liquidity <<<
-        liquidity: liquidityUSD,                 // USD
-        liquidityNative: liquidityNativeZig      // ZIG (extra, non-breaking)
+        // Liquidity snapshot
+        liquidity: liquidityUSD,
+        liquidityNative: liquidityNativeZig,
+
+        ...(includeBest ? { bestPool: bestBlock } : {})
       }
     });
   } catch (e) {
@@ -559,9 +765,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-/* =======================================================================
-   GET /tokens/:id/pools  (token header + image; pool metrics)
-   ======================================================================= */
+/* ============================== POOLS: GET /tokens/:id/pools ============================== */
 router.get('/:id/pools', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
@@ -634,9 +838,7 @@ router.get('/:id/pools', async (req, res) => {
   }
 });
 
-/* =======================================================================
-   GET /tokens/:id/holders (with total count)
-   ======================================================================= */
+/* =========================== HOLDERS: GET /tokens/:id/holders =========================== */
 router.get('/:id/holders', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
@@ -676,22 +878,12 @@ router.get('/:id/holders', async (req, res) => {
   }
 });
 
-/* =======================================================================
-   GET /tokens/:id/security  (use public.token_security)
-   ======================================================================= */
-/** GET /tokens/:id/security
- * Uses only columns from your token_security schema.
- * Returns:
- *  - score (0..100) with transparent penalties/bonuses
- *  - checks  (stable, flat keys)
- *  - dev     (birdeye-like details you track)
- */
+/* =========================== SECURITY: GET /tokens/:id/security =========================== */
 router.get('/:id/security', async (req, res) => {
   try {
     const tok = await resolveTokenId(req.params.id);
     if (!tok) return res.status(404).json({ success:false, error:'token not found' });
 
-    // Pull security row
     const sq = await DB.query(`
       SELECT
         token_id,
@@ -713,66 +905,51 @@ router.get('/:id/security', async (req, res) => {
     `, [tok.token_id]);
     const s = sq.rows[0] || null;
 
-    // Always get exponent from tokens for display scaling
     const tq = await DB.query(
       `SELECT exponent, created_at FROM public.tokens WHERE token_id=$1`,
       [tok.token_id]
     );
     const exp = tq.rows[0]?.exponent != null ? Number(tq.rows[0]?.exponent) : 6;
-    // Helpers
+
     const toDisp = (v) => v == null ? null : Number(v) / 10 ** exp;
     const num = (v, d = 0) => v == null ? d : Number(v);
 
-    // Derived display values
     const maxSupplyDisp   = toDisp(s?.max_supply_base);
     const totalSupplyDisp = toDisp(s?.total_supply_base);
     const creatorBalDisp  = toDisp(s?.creator_balance_base);
 
-    const creatorPctOfMax = num(s?.creator_pct_of_max, 0); // %
-    const top10PctOfMax   = num(s?.top10_pct_of_max, 0);   // %
+    const creatorPctOfMax = num(s?.creator_pct_of_max, 0);
+    const top10PctOfMax   = num(s?.top10_pct_of_max, 0);
     const holdersCount    = num(s?.holders_count, 0);
 
-    // --------- Scoring (only what you actually track) ----------
-    // Start at 100, subtract penalties, add bonuses, clamp 1..99
     const penalties = [];
     const bonuses   = [];
 
-    // Mintability / supply mutability
-    if (s?.is_mintable === true) {
-      penalties.push({k:'is_mintable', pts:12});
-    } else {
-      bonuses.push({k:'not_mintable', pts:4});
-    }
+    if (s?.is_mintable === true) penalties.push({k:'is_mintable', pts:12});
+    else bonuses.push({k:'not_mintable', pts:4});
 
-    if (s?.can_change_minting_cap === true) {
-      penalties.push({k:'can_change_minting_cap', pts:8});
-    }
+    if (s?.can_change_minting_cap === true) penalties.push({k:'can_change_minting_cap', pts:8});
 
-    // Distribution concentration (top10 of max supply)
     if (top10PctOfMax >= 75) penalties.push({k:'top10>=75%', pts:20});
     else if (top10PctOfMax >= 50) penalties.push({k:'top10>=50%', pts:12});
     else if (top10PctOfMax >= 30) penalties.push({k:'top10>=30%', pts:6});
     else bonuses.push({k:'top10<30%', pts:4});
 
-    // Creator concentration (of max supply)
     if (creatorPctOfMax >= 25) penalties.push({k:'creator>=25%', pts:18});
     else if (creatorPctOfMax >= 10) penalties.push({k:'creator>=10%', pts:10});
     else if (creatorPctOfMax > 0) bonuses.push({k:'creator<10%', pts:3});
 
-    // Holder base
     if (holdersCount < 100) penalties.push({k:'holders<100', pts:8});
     else if (holdersCount < 1000) penalties.push({k:'holders<1k', pts:4});
     else if (holdersCount >= 10000) bonuses.push({k:'holders>=10k', pts:5});
-    else if (holdersCount >= 50000) bonuses.push({k:'holders>=50k', pts:10}); // rare bonus
+    else if (holdersCount >= 50000) bonuses.push({k:'holders>=50k', pts:10});
 
-    // Supply fully minted bonus
     if (s?.is_mintable === false && s?.max_supply_base != null && s?.total_supply_base != null) {
       if (String(s.max_supply_base) === String(s.total_supply_base)) {
         bonuses.push({k:'fully_minted_equals_max', pts:4});
       }
     }
 
-    // Age bonus (first_seen_at older than 30d)
     const firstSeen = s?.first_seen_at ? new Date(s.first_seen_at) : null;
     if (firstSeen) {
       const daysAlive = (Date.now() - firstSeen.getTime()) / (1000*60*60*24);
@@ -786,9 +963,7 @@ router.get('/:id/security', async (req, res) => {
     for (const b of bonuses)   score += b.pts;
     score = Math.max(1, Math.min(99, Math.round(score)));
 
-    // ---------- Response shape ----------
     const checks = {
-      // flat & explicit (good for UI badges)
       isMintable: !!(s?.is_mintable),
       canChangeMintingCap: !!(s?.can_change_minting_cap),
       maxSupply: maxSupplyDisp,
@@ -799,7 +974,6 @@ router.get('/:id/security', async (req, res) => {
     };
 
     const dev = {
-      // birdeye-like details you actually store
       tokenTotalSupply: totalSupplyDisp,
       creatorAddress: s?.creator_address || null,
       creatorBalance: creatorBalDisp,
@@ -833,8 +1007,8 @@ router.get('/:id/security', async (req, res) => {
         penalties,
         bonuses,
         categories,
-        checks,   // backwards-friendly, simple keys
-        dev,      // for a “Dev / Ownership” panel
+        checks,
+        dev,
         lastUpdated: s?.checked_at || null,
         source: 'token_security'
       }
@@ -844,11 +1018,8 @@ router.get('/:id/security', async (req, res) => {
   }
 });
 
-
-/* =======================================================================
-   GET /tokens/:id/ohlcv  — FIXED (canonical seconds + seeded fill)
-   ======================================================================= */
-
+/* =============================== OHLCV: GET /tokens/:id/ohlcv =============================== */
+/* When priceSource=best, we use bestSellPool() (same as /swap). 'all' and explicit 'pool' still supported. */
 function tfToSec(tf) {
   const m = { m:60, h:3600, d:86400, w:604800, M:2592000 };
   const map = {
@@ -876,8 +1047,9 @@ router.get('/:id/ohlcv', async (req, res) => {
     const poolIdParam = req.query.poolId;
     const pairParam   = req.query.pair;
     const fill = (req.query.fill || 'none').toLowerCase(); // prev|zero|none
+    const minTvlZigBest = Number(req.query.minBestTvl || '0');
+    const amtParam      = req.query.amt ? Number(req.query.amt) : undefined;
 
-    // Resolve window
     const now = new Date();
     let toIso   = req.query.to || now.toISOString();
     let fromIso = req.query.from || null;
@@ -904,7 +1076,7 @@ router.get('/:id/ohlcv', async (req, res) => {
     const exp = ss.rows[0]?.exponent != null ? Number(ss.rows[0]?.exponent) : 6;
     const circ = ss.rows[0]?.total_supply_base != null ? Number(ss.rows[0].total_supply_base) / 10**exp : null;
 
-    // Determine pool set + seed prevClose (last close before fromIso)
+    // Determine pool set + seed prevClose
     let headerSQL = ``;
     let params = [];
     let seedPrevClose = null;
@@ -928,21 +1100,17 @@ router.get('/:id/ohlcv', async (req, res) => {
         ORDER BY o.bucket_start DESC LIMIT 1
       `, [tok.token_id, fromIso]);
       seedPrevClose = q.rows[0]?.close != null ? Number(q.rows[0].close) : null;
-    } else {
+    } else if (priceSource === 'pool') {
       let poolRow = null;
-      if (priceSource === 'pool' && (poolIdParam || pairParam)) {
+      if (poolIdParam || pairParam) {
         const { rows } = await DB.query(
           `SELECT pool_id FROM pools WHERE (pool_id::text=$1 OR pair_contract=$1) AND base_token_id=$2 LIMIT 1`,
           [poolIdParam || pairParam, tok.token_id]
         );
         poolRow = rows[0] || null;
       }
-      if (!poolRow) {
-        const { pool } = await resolvePoolSelection(tok.token_id, { priceSource, poolId: poolIdParam });
-        poolRow = pool;
-      }
       if (!poolRow?.pool_id) {
-        return res.json({ success:true, data: [], meta:{ tf, mode, unit, fill, priceSource, poolId:null } });
+        return res.json({ success:true, data: [], meta:{ tf, mode, unit, fill, priceSource:'pool', poolId:null } });
       }
       params = [poolRow.pool_id, fromIso, toIso, stepSec];
       headerSQL = `
@@ -958,6 +1126,27 @@ router.get('/:id/ohlcv', async (req, res) => {
          WHERE pool_id=$1 AND bucket_start < $2::timestamptz
          ORDER BY bucket_start DESC LIMIT 1
       `, [poolRow.pool_id, fromIso]);
+      seedPrevClose = q.rows[0]?.close != null ? Number(q.rows[0].close) : null;
+    } else {
+      // priceSource === 'best' (default): choose the same pool as /swap sell leg
+      const best = await bestSellPool(tok.token_id, { amountIn: amtParam, minTvlZig: minTvlZigBest, zigUsd });
+      if (!best?.poolId) {
+        return res.json({ success:true, data: [], meta:{ tf, mode, unit, fill, priceSource:'best', poolId:null } });
+      }
+      params = [best.poolId, fromIso, toIso, stepSec];
+      headerSQL = `
+        WITH src AS (
+          SELECT o.pool_id, o.bucket_start, o.open, o.high, o.low, o.close, o.volume_zig, o.trade_count
+          FROM ohlcv_1m o
+          WHERE o.pool_id=$1
+            AND o.bucket_start >= $2::timestamptz AND o.bucket_start < $3::timestamptz
+        ),
+      `;
+      const q = await DB.query(`
+        SELECT close FROM ohlcv_1m
+         WHERE pool_id=$1 AND bucket_start < $2::timestamptz
+         ORDER BY bucket_start DESC LIMIT 1
+      `, [best.poolId, fromIso]);
       seedPrevClose = q.rows[0]?.close != null ? Number(q.rows[0].close) : null;
     }
 
@@ -997,7 +1186,7 @@ router.get('/:id/ohlcv', async (req, res) => {
       ORDER BY ts_sec ASC
     `, params);
 
-    // JS gap fill on numeric seconds (UTC)
+    // JS gap fill
     const start = Math.floor(new Date(fromIso).getTime() / 1000 / stepSec) * stepSec;
     const end   = Math.floor(new Date(toIso).getTime()   / 1000 / stepSec) * stepSec;
 
@@ -1022,7 +1211,6 @@ router.get('/:id/ohlcv', async (req, res) => {
         const openAdj = (prevClose != null) ? prevClose : r.open;
         const highAdj = Math.max(r.high, openAdj);
         const lowAdj  = Math.min(r.low,  openAdj);
-
         const base = { ts_sec: ts, open: openAdj, high: highAdj, low: lowAdj, close: r.close, volume: r.volume, trades: r.trades };
         out.push(base);
         prevClose = base.close;
@@ -1056,18 +1244,45 @@ router.get('/:id/ohlcv', async (req, res) => {
       data: conv,
       meta: {
         tf, mode, unit, fill, priceSource,
-        poolId: (params[0] && priceSource !== 'all') ? String(params[0]) : null,
         stepSec,
         alignedFromSec: start,
         alignedToSecExclusive: end + stepSec,
         prevCloseSeed: Number.isFinite(seedPrevClose) ? seedPrevClose : null
       }
     });
-
   } catch (e) {
     res.status(500).json({ success:false, error: e.message });
   }
 });
 
+/* =========================== BEST POOL ONLY: GET /tokens/:id/best-pool =========================== */
+/* Mirrors /swap’s selection. Accepts ?amt=<tokens in display units> & ?minBestTvl=<ZIG>. */
+router.get('/:id/best-pool', async (req, res) => {
+  try {
+    const tok = await resolveTokenId(req.params.id);
+    if (!tok) return res.status(404).json({ success:false, error:'token not found' });
+
+    const minTvlZig = Number(req.query.minBestTvl || '0');
+    const amtParam  = req.query.amt ? Number(req.query.amt) : undefined;
+    const zigUsd    = await getZigUsd();
+
+    const best  = await bestSellPool(tok.token_id, { amountIn: amtParam, minTvlZig, zigUsd });
+    if (!best) return res.json({ success:true, data:null });
+
+    res.json({ success:true, data: {
+      poolId: best.poolId,
+      pairContract: best.pairContract,
+      pairType: best.pairType,
+      fee: best.fee,
+      priceNativeMid: best.priceInZig,
+      tvlNative: best.tvlZig,
+      reserves: { zig: best.zigReserve, token: best.tokenReserve },
+      sim: best.sim || null,
+      amtUsed: best.amtUsed
+    }});
+  } catch (e) {
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
 
 export default router;
