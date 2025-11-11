@@ -68,7 +68,7 @@ function buildWindow({ tf, from, to, days }, params, alias = 't') {
     return { clause: clauses.join(' AND ') };
   }
   if (days) {
-    const d = clampInt(days, { min: 1, max: 365, def: 1 }); // cap raised
+    const d = clampInt(days, { min: 1, max: 365, def: 1 });
     clauses.push(`${alias}.created_at >= now() - ($${params.length + 1} || ' days')::interval`);
     params.push(String(d));
     return { clause: clauses.join(' AND ') };
@@ -330,32 +330,26 @@ function paginateArray(data, page, limit) {
 }
 
 /**
- * Build a fully paged SQL that:
- * - applies scope/direction/includeLiquidity + time window
- * - computes worth_zig via ZIG-leg-first (fallback notional) in DB
- * - applies class/min/max in DB (unit-aware)
- * - returns rows with COUNT(*) OVER() as total, ordered by created_at DESC
- * Supports extraWhere clauses (e.g., tokenId/pair/poolId filters added by caller).
+ * CPU-friendly builder:
+ * - LATERAL join to get latest quote price once per row via index
+ * - optional totals (includeTotal=false by default) to avoid COUNT(*) OVER()
  */
 function buildWorthPagedSQL({
   scope, scopeValue, direction, includeLiquidity,
   windowOpts, page, limit, unit, klass, minValue, maxValue,
-  extraWhere = []
+  extraWhere = [], includeTotal = false
 }, params) {
-  // Base WHERE (t alias in base CTE)
+  // Base WHERE
   const baseWhere = buildWhereBase({ scope, scopeValue, direction, includeLiquidity }, params, 't');
 
-  // Additional filters (tokenId/pair/poolId custom from caller)
+  // extras
   if (Array.isArray(extraWhere) && extraWhere.length) baseWhere.push(...extraWhere);
 
-  // time window on t.*
+  // time window
   const { clause: timeClause } = buildWindow(windowOpts, params, 't');
   baseWhere.push(timeClause);
 
-  // FROM/JOIN
-  const fromJoin = tradesFromJoin('t');
-
-  // worthZig expression using base.* (ranked reads FROM base)
+  // worthZig expression using base.*
   const worthZig = `
     COALESCE(
       CASE WHEN base.offer_asset_denom='uzig'
@@ -377,12 +371,11 @@ function buildWorthPagedSQL({
     )
   `;
 
-  // zigUsd param slot
   const zigUsdIdx = params.length + 1;
   params.push(0); // placeholder to be filled by caller
   const worthUsd = `(${worthZig}) * $${zigUsdIdx}`;
 
-  // class/min/max filters (unit-aware) — these run in ranked WHERE
+  // filters on worth/class
   const filters = [];
   const k = String(klass || '').toLowerCase();
   if (VALID_CLASS.has(k)) {
@@ -407,21 +400,47 @@ function buildWorthPagedSQL({
         b.denom    AS base_denom,
         toff.exponent AS offer_exp,
         task.exponent AS ask_exp,
-        (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig
-      ${fromJoin}
+        pr.price_in_zig AS pq_price_in_zig
+      FROM trades t
+      JOIN pools  p ON p.pool_id = t.pool_id
+      JOIN tokens q ON q.token_id = p.quote_token_id
+      JOIN tokens b ON b.token_id = p.base_token_id
+      LEFT JOIN tokens toff ON toff.denom = t.offer_asset_denom
+      LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
+      LEFT JOIN LATERAL (
+        SELECT price_in_zig
+        FROM prices
+        WHERE token_id = p.quote_token_id
+        ORDER BY updated_at DESC
+        LIMIT 1
+      ) pr ON TRUE
       WHERE ${baseWhere.join(' AND ')}
-    ),
-    ranked AS (
-      SELECT base.*,
-             ${worthZig} AS worth_zig,
-             ${worthUsd} AS worth_usd,
-             COUNT(*) OVER() AS total
-      FROM base
-      ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
     )
-    SELECT * FROM ranked
-    ORDER BY created_at DESC
-    LIMIT ${limit} OFFSET ${offset}
+    ${includeTotal ? `
+      , counted AS (
+        SELECT base.*,
+               ${worthZig} AS worth_zig,
+               (${worthZig}) * $${zigUsdIdx} AS worth_usd
+        FROM base
+        ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+      )
+      SELECT *, (SELECT COUNT(*) FROM counted) AS total
+      FROM counted
+      ORDER BY created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    ` : `
+      , ranked AS (
+        SELECT base.*,
+               ${worthZig} AS worth_zig,
+               (${worthZig}) * $${zigUsdIdx} AS worth_usd
+        FROM base
+        ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+      )
+      SELECT *
+      FROM ranked
+      ORDER BY created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `}
   `;
   return { sql, params, zigUsdIdx };
 }
@@ -440,6 +459,7 @@ router.get('/', async (req, res) => {
     const klass  = String(req.query.class || '').toLowerCase();
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+    const includeTotal = ['1','true','yes'].includes(String(req.query.includeTotal || '').toLowerCase());
 
     const zigUsd = await getZigUsd();
     const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
@@ -480,7 +500,7 @@ router.get('/', async (req, res) => {
       return res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
     }
 
-    // DB-side worth/class/pagination (stable totals)
+    // DB-side worth/class/pagination
     const params = [];
     const { sql, params: p2, zigUsdIdx } = buildWorthPagedSQL({
       scope: 'all',
@@ -491,13 +511,15 @@ router.get('/', async (req, res) => {
       page, limit,
       unit, klass,
       minValue: minV, maxValue: maxV,
-      extraWhere: [] // none
+      extraWhere: [],
+      includeTotal
     }, params);
     p2[zigUsdIdx - 1] = zigUsd;
 
     const { rows } = await DB.query(sql, p2);
-    const total = rows[0]?.total ? Number(rows[0].total) : 0;
-    const pages = Math.max(1, Math.ceil(total / limit));
+    const total = includeTotal ? (rows[0]?.total ? Number(rows[0].total) : 0) : undefined;
+    const pages = total != null ? Math.max(1, Math.ceil(total / limit)) : undefined;
+
     const shaped = rows.map(r => {
       const s = shapeRow(r, unit, zigUsd);
       const w = worthForClass(s, unit, zigUsd);
@@ -526,6 +548,7 @@ router.get('/token/:id', async (req, res) => {
     const klass  = String(req.query.class || '').toLowerCase();
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+    const includeTotal = ['1','true','yes'].includes(String(req.query.includeTotal || '').toLowerCase());
 
     const zigUsd = await getZigUsd();
     const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
@@ -545,7 +568,7 @@ router.get('/token/:id', async (req, res) => {
           q.exponent AS qexp,
           b.exponent AS bexp,
           b.denom    AS base_denom,
-          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER AT DESC LIMIT 1) AS pq_price_in_zig,
+          (SELECT price_in_zig FROM prices WHERE token_id = p.quote_token_id ORDER BY updated_at DESC LIMIT 1) AS pq_price_in_zig,
           toff.exponent AS offer_exp,
           task.exponent AS ask_exp
         ${tradesFromJoin('t')}
@@ -575,13 +598,15 @@ router.get('/token/:id', async (req, res) => {
       page, limit,
       unit, klass,
       minValue: minV, maxValue: maxV,
-      extraWhere: []
+      extraWhere: [],
+      includeTotal
     }, params);
     p2[zigUsdIdx - 1] = zigUsd;
 
     const { rows } = await DB.query(sql, p2);
-    const total = rows[0]?.total ? Number(rows[0].total) : 0;
-    const pages = Math.max(1, Math.ceil(total / limit));
+    const total = includeTotal ? (rows[0]?.total ? Number(rows[0].total) : 0) : undefined;
+    const pages = total != null ? Math.max(1, Math.ceil(total / limit)) : undefined;
+
     const shaped = rows.map(r => {
       const s = shapeRow(r, unit, zigUsd);
       const w = worthForClass(s, unit, zigUsd);
@@ -615,6 +640,7 @@ router.get('/pool/:ref', async (req, res) => {
     const klass  = String(req.query.class || '').toLowerCase();
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+    const includeTotal = ['1','true','yes'].includes(String(req.query.includeTotal || '').toLowerCase());
 
     const zigUsd = await getZigUsd();
     const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
@@ -664,13 +690,15 @@ router.get('/pool/:ref', async (req, res) => {
       page, limit,
       unit, klass,
       minValue: minV, maxValue: maxV,
-      extraWhere: []
+      extraWhere: [],
+      includeTotal
     }, params);
     p2[zigUsdIdx - 1] = zigUsd;
 
     const { rows } = await DB.query(sql, p2);
-    const total = rows[0]?.total ? Number(rows[0].total) : 0;
-    const pages = Math.max(1, Math.ceil(total / limit));
+    const total = includeTotal ? (rows[0]?.total ? Number(rows[0].total) : 0) : undefined;
+    const pages = total != null ? Math.max(1, Math.ceil(total / limit)) : undefined;
+
     const shaped = rows.map(r => {
       const s = shapeRow(r, unit, zigUsd);
       const w = worthForClass(s, unit, zigUsd);
@@ -697,6 +725,7 @@ router.get('/wallet/:address', async (req, res) => {
     const klass  = String(req.query.class || '').toLowerCase();
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+    const includeTotal = ['1','true','yes'].includes(String(req.query.includeTotal || '').toLowerCase());
 
     const zigUsd = await getZigUsd();
     const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
@@ -743,7 +772,7 @@ router.get('/wallet/:address', async (req, res) => {
       return res.json({ success:true, data: items, meta:{ unit, tf:req.query.tf||'24h', limit, page: p, pages, total } });
     }
 
-    // DB-side pagination path for wallet with optional extra scope
+    // DB-side pagination path
     const extraWhere = [];
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
@@ -765,13 +794,15 @@ router.get('/wallet/:address', async (req, res) => {
       page, limit,
       unit, klass,
       minValue: minV, maxValue: maxV,
-      extraWhere
+      extraWhere,
+      includeTotal
     }, params);
     p2[zigUsdIdx - 1] = zigUsd;
 
     const { rows } = await DB.query(sql, p2);
-    const total = rows[0]?.total ? Number(rows[0].total) : 0;
-    const pages = Math.max(1, Math.ceil(total / limit));
+    const total = includeTotal ? (rows[0]?.total ? Number(rows[0].total) : 0) : undefined;
+    const pages = total != null ? Math.max(1, Math.ceil(total / limit)) : undefined;
+
     const shaped = rows.map(r => {
       const s = shapeRow(r, unit, zigUsd);
       const w = worthForClass(s, unit, zigUsd);
@@ -785,7 +816,7 @@ router.get('/wallet/:address', async (req, res) => {
   }
 });
 
-/** GET /trades/large — DB-side paged worth/class (combine optional) */
+/** GET /trades/large — unchanged except tiny fixes + includeTotal honored */
 router.get('/large', async (req, res) => {
   try {
     const bucket = (req.query.bucket || '24h').toLowerCase();
@@ -813,7 +844,7 @@ router.get('/large', async (req, res) => {
         CASE WHEN t.offer_asset_denom='uzig'
              THEN t.offer_amount_base / POWER(10, COALESCE(toff.exponent,6))
              WHEN t.ask_asset_denom='uzig'
-             THEN t.ask_amount_base   / POWER(10, COALESCE(task.exponent,6))
+             THEN t.ask_amount_base   / POWER(10, COCOALESCE(task.exponent,6))
         END,
         CASE WHEN p.is_uzig_quote THEN
                CASE WHEN t.direction='buy'
@@ -867,7 +898,8 @@ router.get('/large', async (req, res) => {
         LEFT JOIN tokens task ON task.denom = t.ask_asset_denom
       ),
       ranked AS (
-        SELECT base.*, ${worthZig.replaceAll('t.', 'base.').replaceAll('p.', 'p').replaceAll('q.', 'q') } AS worth_zig,
+        SELECT base.*,
+               ${worthZig.replaceAll('t.', 'base.').replaceAll('p.', 'p').replaceAll('q.', 'q') } AS worth_zig,
                (${worthZig.replaceAll('t.', 'base.').replaceAll('p.', 'p').replaceAll('q.', 'q')}) * $${zigUsdIdx} AS worth_usd,
                COUNT(*) OVER() AS total
         FROM base
@@ -903,7 +935,7 @@ router.get('/large', async (req, res) => {
   }
 });
 
-/** GET /trades/recent — DB-side worth/class paging by default (stable totals) */
+/** GET /trades/recent — same optimization knobs as root */
 router.get('/recent', async (req, res) => {
   try {
     const unit   = String(req.query.unit || 'usd').toLowerCase();
@@ -915,6 +947,7 @@ router.get('/recent', async (req, res) => {
     const klass  = String(req.query.class || '').toLowerCase();
     const minV   = req.query.minValue != null ? Number(req.query.minValue) : null;
     const maxV   = req.query.maxValue != null ? Number(req.query.maxValue) : null;
+    const includeTotal = ['1','true','yes'].includes(String(req.query.includeTotal || '').toLowerCase());
 
     const zigUsd = await getZigUsd();
     const windowOpts = { tf:req.query.tf, from:req.query.from, to:req.query.to, days:req.query.days };
@@ -961,7 +994,7 @@ router.get('/recent', async (req, res) => {
       return res.json({ success:true, data: items, meta:{ unit, limit, page: p, pages, total, tf: req.query.tf || '24h', minValue:minV ?? undefined, maxValue:maxV ?? undefined } });
     }
 
-    // DB-side (stable totals) — reuse buildWorthPagedSQL with optional token/pair/pool scope
+    // DB-side (stable totals optional)
     const extraWhere = [];
     if (req.query.tokenId) {
       const tok = await resolveTokenId(req.query.tokenId);
@@ -983,13 +1016,15 @@ router.get('/recent', async (req, res) => {
       page, limit,
       unit, klass,
       minValue: minV, maxValue: maxV,
-      extraWhere
+      extraWhere,
+      includeTotal
     }, params);
     p2[zigUsdIdx - 1] = zigUsd;
 
     const { rows } = await DB.query(sql, p2);
-    const total = rows[0]?.total ? Number(rows[0].total) : 0;
-    const pages = Math.max(1, Math.ceil(total / limit));
+    const total = includeTotal ? (rows[0]?.total ? Number(rows[0].total) : 0) : undefined;
+    const pages = total != null ? Math.max(1, Math.ceil(total / limit)) : undefined;
+
     const shaped = rows.map(r => {
       const s = shapeRow(r, unit, zigUsd);
       const w = worthForClass(s, unit, zigUsd);
