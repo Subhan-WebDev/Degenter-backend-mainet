@@ -105,6 +105,7 @@ function exponentFromRegistryDisplay(a) {
     units.find(u => (u?.denom === display) && (u?.exponent != null)) ||
     units.find(u => Array.isArray(u?.aliases) && u.aliases.includes(display) && (u?.exponent != null));
   const exp = match?.exponent;
+  console.log("exponent from registry display", exp);
   const n = typeof exp === 'string' ? Number(exp) : exp;
   return Number.isFinite(n) ? n : null;
 }
@@ -125,17 +126,21 @@ async function ensureRegistryLoaded() {
     const mod = await import('chain-registry');
     REGISTRY = mod?.default ?? mod ?? {};
     const lists = Array.isArray(REGISTRY.assetLists) ? REGISTRY.assetLists : [];
+    
     // try exact chain_name: 'zigchain'
     ZIG_ASSET_LIST =
-      lists.find(l => String(l?.chain_name ?? '').toLowerCase() === 'zigchain') ||
-      // fallback: the one that contains base 'uzig' or symbol includes 'zig'
-      lists.find(l => Array.isArray(l?.assets) && l.assets.some(a => a?.base === 'uzig')) ||
-      lists.find(l => Array.isArray(l?.assets) && l.assets.some(a => {
+    lists.find(l => String(l?.chain_name ?? '').toLowerCase() === 'zigchain') ||
+    // fallback: the one that contains base 'uzig' or symbol includes 'zig'
+    // lists.find(l => Array.isArray(l?.assets) && l.assets.some(a => a?.base === 'uzig')) ||
+    lists.find(l => Array.isArray(l?.assets) && l.assets.some(a => {
         const sym = String(a?.symbol ?? '').toLowerCase();
         const disp = String(a?.display ?? '').toLowerCase();
-        return sym.includes('zig') || disp.includes('zig');
+        return disp
+        // return sym.includes('zig') || disp.includes('zig');
       })) ||
       null;
+      // console.log(ZIG_ASSET_LIST, "zigchain list");
+      
     if (!ZIG_ASSET_LIST) {
       debug('[registry] ZigChain asset list not found in installed chain-registry');
     }
@@ -148,6 +153,8 @@ function findRegistryAsset(denomOrBase) {
   if (!ZIG_ASSET_LIST || !denomOrBase) return null;
   const q = String(denomOrBase).toLowerCase();
   const list = ZIG_ASSET_LIST.assets || [];
+  // console.log("Searching registry for:", q, list);
+  
 
   // 1) exact base match (handles ibc/<HASH> & native base like uzig)
   let a = list.find(x => String(x?.base ?? '').toLowerCase() === q);
@@ -248,6 +255,7 @@ export async function setTokenMetaFromLCD(denom) {
         // If IBC, prefer to match the exact ibc/<HASH>; otherwise match base or unit by denom.
         const key = isIbc ? denom : lookupDenom;
         const a = findRegistryAsset(key) || (isIbc && baseFromTrace ? findRegistryAsset(baseFromTrace) : null);
+        console.log('Registry asset for', key, a);
         if (a) {
           reg_name    = a?.name ?? null;
           reg_symbol  = a?.symbol ?? null;
