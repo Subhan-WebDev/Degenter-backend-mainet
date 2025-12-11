@@ -191,43 +191,79 @@ export async function processHeight(h) {
           pool.pool_id, pool.base_denom, pool.quote_denom, res1d, res1a, res2d, res2a
         );
 
-        // OHLCV & live price — compute from LCD reserves
         if (pool.is_uzig_quote) {
           try {
             const { rows: rExp } = await DB.query(
               'SELECT exponent AS exp FROM tokens WHERE token_id = $1',
               [pool.base_id]
             );
-            const baseExp = rExp?.[0]?.exp;
-            if (baseExp == null) {
-              debug('[price/skip] meta not ready for base token', { token_id: pool.base_id, denom: pool.base_denom });
+            const baseExpRaw = rExp?.[0]?.exp;
+            if (baseExpRaw == null) {
+              debug('[price/skip] meta not ready for base token', {
+                token_id: pool.base_id,
+                denom:   pool.base_denom,
+              });
+              return;
+            }
+            const baseExp = Number(baseExpRaw);
+
+            // Figure out which reserve is base and which is quote (uzig)
+            let RbRaw = null; // base token raw amount
+            let RqRaw = null; // uzig raw amount
+
+            if (res1d === pool.base_denom && res2d === pool.quote_denom) {
+              RbRaw = res1a;
+              RqRaw = res2a;
+            } else if (res2d === pool.base_denom && res1d === pool.quote_denom) {
+              RbRaw = res2a;
+              RqRaw = res1a;
+            }
+
+            if (RbRaw == null || RqRaw == null) {
+              debug('[price/skip] cannot map reserves to base/quote', {
+                pool: pool.pool_id,
+                base_denom:  pool.base_denom,
+                quote_denom: pool.quote_denom,
+                res1d, res2d,
+              });
               return;
             }
 
-            const reserves = await fetchPoolReserves(pairContract);
-            const price = priceFromReserves_UZIGQuote(
-              { base_denom: pool.base_denom, base_exp: Number(baseExp) },
-              reserves
-            );
+            const Rb = Number(RbRaw || 0);
+            const Rq = Number(RqRaw || 0);
+            if (!(Rb > 0) || !(Rq > 0)) {
+              debug('[price/skip] non-positive reserves', { Rb, Rq });
+              return;
+            }
+
+            // Both base + uzig are on minimal units; baseExp / 6 define human units
+            // price(base in ZIG) = (Rq / 10^6) / (Rb / 10^baseExp)
+            const price =
+              (Rq / 1e6) /
+              (Rb / Math.pow(10, baseExp));
+
             if (price != null && Number.isFinite(price) && price > 0) {
               const quoteRaw = (offer === pool.quote_denom)
                 ? Number(offerAmt || 0)
-                : Number(retAmt || 0);
-              const volZig = quoteRaw / 1e6; // UZIG always 6 decimals
+                : Number(retAmt   || 0);
+              const volZig = quoteRaw / 1e6; // UZIG always has 6 decimals
 
-              const bucket = new Date(Math.floor(new Date(timestamp).getTime() / 60000) * 60000);
+              const bucket = new Date(
+                Math.floor(new Date(timestamp).getTime() / 60000) * 60000
+              );
+
               await upsertOHLCV1m({
                 pool_id: pool.pool_id,
                 bucket_start: bucket,
                 price,
                 vol_zig: volZig,
-                trade_inc: 1
+                trade_inc: 1,
               });
 
               await upsertPrice(pool.base_id, pool.pool_id, price, true);
             }
           } catch (e) {
-            warn('[swap price/lcd]', pairContract, e.message);
+            warn('[swap price/event_reserves]', pairContract, e.message);
           }
         }
       });
