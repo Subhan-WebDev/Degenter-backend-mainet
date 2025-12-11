@@ -4,11 +4,15 @@ import { lcdDenomsMetadata, lcdFactoryDenom, lcdIbcDenomTrace } from '../lib/lcd
 import { warn, debug } from '../lib/log.js';
 import { fetch } from 'undici';
 
-// Optional: registry toggle (defaults ON if the package is installed)
+// Toggle registry integration (ON by default)
 const USE_CHAIN_REGISTRY = (process.env.USE_CHAIN_REGISTRY || '1') === '1';
 
-// CJS default export; we’ll only import if USE_CHAIN_REGISTRY is true
-let REGISTRY = null;
+// URL for ZigChain assetlist in cosmos/chain-registry
+const ZIGCHAIN_ASSETLIST_URL =
+  process.env.CHAIN_REGISTRY_ZIG_URL ||
+  'https://raw.githubusercontent.com/cosmos/chain-registry/master/zigchain/assetlist.json';
+
+// In-memory cache
 let ZIG_ASSET_LIST = null;
 
 /* ──────────────────────────────────────────────────────────────────────────────
@@ -37,7 +41,7 @@ function deriveFromBaseDenom(base) {
   return { symbol: base.toUpperCase(), display: base.toLowerCase(), exponent: 0 };
 }
 
-// from LCD metadata shape
+// From LCD metadata shape
 function expFromDisplay(meta) {
   if (!meta || !meta.display || !Array.isArray(meta.denom_units)) return null;
   const dus = meta.denom_units;
@@ -86,13 +90,11 @@ async function resolveUriPayload(uri) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────────
- * Chain Registry (ZigChain) helpers
+ * Chain Registry (ZigChain) helpers — via raw GitHub JSON
  * ────────────────────────────────────────────────────────────────────────────── */
 
 function getUnitsFromRegistryAsset(a) {
-  // registry uses snake_case: denom_units
   if (Array.isArray(a?.denom_units)) return a.denom_units;
-  // (just in case) some shapes may vary
   if (Array.isArray(a?.denomUnits)) return a.denomUnits;
   return [];
 }
@@ -105,7 +107,6 @@ function exponentFromRegistryDisplay(a) {
     units.find(u => (u?.denom === display) && (u?.exponent != null)) ||
     units.find(u => Array.isArray(u?.aliases) && u.aliases.includes(display) && (u?.exponent != null));
   const exp = match?.exponent;
-  console.log("exponent from registry display", exp);
   const n = typeof exp === 'string' ? Number(exp) : exp;
   return Number.isFinite(n) ? n : null;
 }
@@ -123,47 +124,51 @@ function firstRegistryImage(a) {
 async function ensureRegistryLoaded() {
   if (!USE_CHAIN_REGISTRY || ZIG_ASSET_LIST) return;
   try {
-    const mod = await import('chain-registry');
-    REGISTRY = mod?.default ?? mod ?? {};
-    const lists = Array.isArray(REGISTRY.assetLists) ? REGISTRY.assetLists : [];
-    
-    // try exact chain_name: 'zigchain'
-    ZIG_ASSET_LIST =
-    lists.find(l => String(l?.chain_name ?? '').toLowerCase() === 'zigchain') ||
-    // fallback: the one that contains base 'uzig' or symbol includes 'zig'
-    // lists.find(l => Array.isArray(l?.assets) && l.assets.some(a => a?.base === 'uzig')) ||
-    lists.find(l => Array.isArray(l?.assets) && l.assets.some(a => {
-        const sym = String(a?.symbol ?? '').toLowerCase();
-        const disp = String(a?.display ?? '').toLowerCase();
-        return disp
-        // return sym.includes('zig') || disp.includes('zig');
-      })) ||
-      null;
-      // console.log(ZIG_ASSET_LIST, "zigchain list");
-      
+    const res = await fetch(ZIGCHAIN_ASSETLIST_URL, {
+      headers: { accept: 'application/json, */*;q=0.5' }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const j = await res.json();
+
+    // GitHub raw for `zigchain/assetlist.json` is usually a single object
+    // { chain_name: 'zigchain', assets: [...] }
+    if (j && typeof j === 'object' && Array.isArray(j.assets)) {
+      ZIG_ASSET_LIST = j;
+    } else if (Array.isArray(j)) {
+      // Just in case someone returns an array of lists, pick zigchain or first
+      ZIG_ASSET_LIST =
+        j.find(x => String(x?.chain_name || '').toLowerCase() === 'zigchain') ||
+        j[0] || null;
+    } else {
+      ZIG_ASSET_LIST = null;
+    }
+
     if (!ZIG_ASSET_LIST) {
-      debug('[registry] ZigChain asset list not found in installed chain-registry');
+      debug('[registry] zigchain assetlist: loaded JSON but no usable asset list');
+    } else {
+      debug('[registry] zigchain assetlist loaded from raw URL');
     }
   } catch (e) {
-    debug('[registry] not available:', e.message);
+    debug('[registry] fetch failed:', e.message || String(e));
+    ZIG_ASSET_LIST = null;
   }
 }
 
 function findRegistryAsset(denomOrBase) {
   if (!ZIG_ASSET_LIST || !denomOrBase) return null;
   const q = String(denomOrBase).toLowerCase();
-  const list = ZIG_ASSET_LIST.assets || [];
-  // console.log("Searching registry for:", q, list);
-  
+  const list = Array.isArray(ZIG_ASSET_LIST.assets) ? ZIG_ASSET_LIST.assets : [];
 
-  // 1) exact base match (handles ibc/<HASH> & native base like uzig)
+  // 1) exact base match (ibc/<HASH>, uzig, factory denom, etc.)
   let a = list.find(x => String(x?.base ?? '').toLowerCase() === q);
   if (a) return a;
 
-  // 2) any denom_unit.denom or alias == q (e.g. 'stzig', 'usdc', the ibc hash, etc.)
+  // 2) denom_units.denom or alias match
   a = list.find(x => getUnitsFromRegistryAsset(x).some(du => {
     if (String(du?.denom ?? '').toLowerCase() === q) return true;
-    if (Array.isArray(du?.aliases) && du.aliases.map(y => String(y).toLowerCase()).includes(q)) return true;
+    if (Array.isArray(du?.aliases) &&
+        du.aliases.map(y => String(y).toLowerCase()).includes(q)) return true;
     return false;
   }));
   if (a) return a;
@@ -174,24 +179,24 @@ function findRegistryAsset(denomOrBase) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────────
- * MAIN: setTokenMetaFromLCD → now merges Registry + LCD (supplies from LCD)
+ * MAIN: setTokenMetaFromLCD → Registry + LCD + URI JSON + factory supplies
  * ────────────────────────────────────────────────────────────────────────────── */
 
 /**
  * setTokenMetaFromLCD:
  *  - IBC trace resolution
  *  - Merge sources:
- *     * Registry (ZigChain) for name/symbol/display/denom_units/exponent/image/socials/description
+ *     * ZigChain registry (via GitHub raw assetlist) for name/symbol/display/denom_units/exponent/image/socials/description
  *     * LCD metadata for same (fallback) + LCD uri-json (preferred socials/desc)
  *     * Supplies (max/total) from LCD factory only
- *  - Keep your existing non-overwrite behavior (no null clobber)
+ *  - No null clobbering of existing DB fields
  */
 export async function setTokenMetaFromLCD(denom) {
   try {
     // Ensure description column exists (idempotent)
     await DB.query(`ALTER TABLE IF EXISTS tokens ADD COLUMN IF NOT EXISTS description TEXT`).catch(() => {});
 
-    // ── IBC handling ──────────────────────────────────────────────────────────
+    // ── IBC handling ────────────────────────────────────────────────────────
     let lookupDenom = denom;
     let isIbc = false;
     let baseFromTrace = null;
@@ -199,12 +204,12 @@ export async function setTokenMetaFromLCD(denom) {
     if (typeof denom === 'string' && denom.startsWith('ibc/')) {
       isIbc = true;
       const trace = await lcdIbcDenomTrace(denom).catch(() => null);
-      baseFromTrace = trace?.denom?.base || null;  // e.g. 'uatom' for ATOM
+      baseFromTrace = trace?.denom?.base || null;  // e.g. 'uatom'
       if (baseFromTrace) lookupDenom = baseFromTrace;
       await DB.query(`UPDATE tokens SET type='ibc' WHERE denom=$1`, [denom]).catch(() => {});
     }
 
-    // ── LCD metadata ─────────────────────────────────────────────────────────
+    // ── LCD metadata ────────────────────────────────────────────────────────
     const meta = await lcdDenomsMetadata(lookupDenom).catch(() => null);
     const m = meta?.metadata;
 
@@ -214,7 +219,7 @@ export async function setTokenMetaFromLCD(denom) {
     let lcdDesc     = m?.description ?? null;
     let lcd_uri     = m?.uri ?? null;
 
-    // decide exponent from LCD once
+    // exponent from LCD once
     let lcd_exponent = expFromDisplay(m);
 
     // IBC fallback: if LCD exponent missing, default to 6
@@ -231,10 +236,10 @@ export async function setTokenMetaFromLCD(denom) {
       if (lcd_exponent == null) lcd_exponent = 0;
     }
 
-    // IBC: if no display at all, show traced base visibly
+    // IBC: if no display at all, fall back to traced base so UI isn’t blind
     if (!lcd_display && isIbc && baseFromTrace) lcd_display = baseFromTrace;
 
-    // resolve LCD uri payload (preferred socials/description if present)
+    // Resolve LCD uri payload (preferred socials/description if present)
     let imageFromUri = null, siteFromUri = null, twFromUri = null, tgFromUri = null, descFromUri = null;
     if (lcd_uri) {
       const r = await resolveUriPayload(lcd_uri);
@@ -245,17 +250,15 @@ export async function setTokenMetaFromLCD(denom) {
       descFromUri  = r.description;
     }
 
-    // ── Registry metadata (ZigChain AssetList) ───────────────────────────────
+    // ── Registry metadata (ZigChain asset list via raw URL) ─────────────────
     let reg_name = null, reg_symbol = null, reg_display = null, reg_exponent = null;
     let reg_image = null, reg_desc = null, reg_site = null, reg_twitter = null, reg_telegram = null;
 
     if (USE_CHAIN_REGISTRY) {
       await ensureRegistryLoaded();
       if (ZIG_ASSET_LIST) {
-        // If IBC, prefer to match the exact ibc/<HASH>; otherwise match base or unit by denom.
         const key = isIbc ? denom : lookupDenom;
         const a = findRegistryAsset(key) || (isIbc && baseFromTrace ? findRegistryAsset(baseFromTrace) : null);
-        console.log('Registry asset for', key, a);
         if (a) {
           reg_name    = a?.name ?? null;
           reg_symbol  = a?.symbol ?? null;
@@ -273,9 +276,7 @@ export async function setTokenMetaFromLCD(denom) {
       }
     }
 
-    // ── Merge policy ─────────────────────────────────────────────────────────
-    // name/symbol/display: prefer registry if non-empty else LCD.
-    // Special casing: if both registry.display and LCD.display exist and differ only by case -> keep LCD casing.
+    // ── Merge policy ────────────────────────────────────────────────────────
     function sameLettersDiffCase(a, b) {
       if (!a || !b) return false;
       return a.toLowerCase() === b.toLowerCase() && a !== b;
@@ -287,16 +288,16 @@ export async function setTokenMetaFromLCD(denom) {
 
     let display = reg_display || lcd_display || null;
     if (reg_display && lcd_display && sameLettersDiffCase(reg_display, lcd_display)) {
-      display = lcd_display; // LCD casing wins when text is same
+      display = lcd_display; // LCD casing wins when text content is same
     }
 
-    // exponent: prefer registry (curated), else LCD; keep your defaults already applied above
+    // exponent: prefer registry (curated), else LCD; LCD already has fallback logic
     let exponent = (reg_exponent != null) ? reg_exponent : lcd_exponent;
 
-    // image: prefer registry logo; if none, take LCD uri image
+    // image: prefer registry logo; then LCD uri image
     const image_uri = reg_image || imageFromUri || null;
 
-    // description: LCD uri json first, then registry desc, then LCD description
+    // description: LCD uri json first, then registry, then LCD description
     const finalDesc = normString(descFromUri) || normString(reg_desc) || normString(lcdDesc) || null;
 
     // socials: LCD uri json first, then registry socials
@@ -304,7 +305,7 @@ export async function setTokenMetaFromLCD(denom) {
     const twitter  = normUrl(twFromUri)    || normUrl(reg_twitter) || null;
     const telegram = normUrl(tgFromUri)    || normUrl(reg_telegram) || null;
 
-    // ── Final DB update (no null clobbering) ─────────────────────────────────
+    // ── Final DB update (no null clobbering) ────────────────────────────────
     await DB.query(`
       UPDATE tokens
       SET name        = COALESCE($2,  name),
@@ -332,7 +333,7 @@ export async function setTokenMetaFromLCD(denom) {
       isIbc
     ]);
 
-    // ── Supplies from factory (when available) ───────────────────────────────
+    // ── Supplies from factory (when available) ──────────────────────────────
     const fact = await lcdFactoryDenom(lookupDenom).catch(() => null);
     if (fact && (fact.total_supply || fact.total_minted)) {
       await DB.query(
